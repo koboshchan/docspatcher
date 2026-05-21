@@ -174,7 +174,7 @@ function buildBridgeHtml_(wsUrl, token) {
                 logLine('getcontents failure')
                 sendError(id, err && err.message)
               })
-              .mcp_getContents(params.id, params.startLine, params.endLine)
+              .mcp_getContents(params.id, params.startLine, params.endLine, params.format)
             return
           }
 
@@ -188,7 +188,7 @@ function buildBridgeHtml_(wsUrl, token) {
                 logLine('applypatch failure')
                 sendError(id, err && err.message)
               })
-              .mcp_applyPatch(params.id, params.patch, params.algorithm)
+              .mcp_applyPatch(params.id, params.patch, params.algorithm, params.format)
             return
           }
 
@@ -208,16 +208,20 @@ function mcp_searchFiles(query, limit) {
   return searchFiles(query, limit)
 }
 
-function mcp_getContents(id, startLine, endLine) {
-  return getContents(id, startLine, endLine)
+function mcp_getContents(id, startLine, endLine, format) {
+  return getContents(id, startLine, endLine, format)
 }
 
-function mcp_applyPatch(id, patchText, algorithm) {
-  return applyPatchToDocument(id, patchText, algorithm)
+function mcp_applyPatch(id, patchText, algorithm, format) {
+  return applyPatchToDocument(id, patchText, algorithm, format)
 }
 
-function getContents(id, startLine, endLine) {
-  const text = DocumentApp.openById(id).getBody().editAsText().getText()
+function getContents(id, startLine, endLine, format) {
+  const normalizedFormat = normalizeContentFormat_(format)
+  const text =
+    normalizedFormat === 'markdown'
+      ? exportDocumentAsMarkdown_(id)
+      : DocumentApp.openById(id).getBody().editAsText().getText()
   const lines = text.split('\n')
   const totalLines = lines.length
 
@@ -234,6 +238,7 @@ function getContents(id, startLine, endLine) {
   }
 
   return {
+    format: normalizedFormat,
     startLine: start,
     endLine: end,
     totalLines,
@@ -242,15 +247,48 @@ function getContents(id, startLine, endLine) {
   }
 }
 
-function applyPatchToDocument(id, patchText, algorithm) {
+function applyPatchToDocument(id, patchText, algorithm, format) {
   const dmp = new diff_match_patch()
-  const doctext = DocumentApp.openById(id).getBody().editAsText()
   const mode = (algorithm || 'unified').toLowerCase()
+  const normalizedFormat = normalizeContentFormat_(format)
+
+  if (normalizedFormat === 'markdown') {
+    const markdown = exportDocumentAsMarkdown_(id)
+    let text2
+    let patchesOrHunks
+    let results
+
+    if (mode === 'unified') {
+      const hunks = parseUnifiedHunks_(patchText)
+      const unifiedResult = applyUnifiedHunksToText_(markdown, hunks)
+      text2 = unifiedResult[0]
+      results = unifiedResult[1]
+      patchesOrHunks = hunks
+    } else {
+      const dmpResult = applyPatchToText_(markdown, patchText, dmp)
+      text2 = dmpResult[0]
+      patchesOrHunks = dmpResult[1]
+      results = dmpResult[2]
+    }
+
+    importMarkdownIntoExistingDocument_(id, text2)
+    return {
+      algorithm: mode === 'unified' ? 'unified' : 'dmp',
+      format: 'markdown',
+      patches: patchesOrHunks.length,
+      results,
+      textLength: text2.length,
+    }
+  }
+
+  const body = DocumentApp.openById(id).getBody()
+  const doctext = body.editAsText()
 
   if (mode === 'unified') {
     const [text2, hunks, results] = applyUnifiedPatch(doctext, patchText, dmp)
     return {
       algorithm: 'unified',
+      format: 'text',
       patches: hunks.length,
       results,
       textLength: text2.length,
@@ -260,10 +298,349 @@ function applyPatchToDocument(id, patchText, algorithm) {
   const [text2, patches, results] = applyPatch(doctext, patchText, dmp)
   return {
     algorithm: 'dmp',
+    format: 'text',
     patches: patches.length,
     results,
     textLength: text2.length,
   }
+}
+
+function normalizeContentFormat_(format) {
+  const value = String(format || 'text').toLowerCase()
+  return value === 'markdown' ? 'markdown' : 'text'
+}
+
+function exportDocumentAsMarkdown_(documentId) {
+  const doc = docsApiGetDocument_(documentId)
+  return markdownFromDocsApiDocument_(doc)
+}
+
+function importMarkdownIntoExistingDocument_(targetDocumentId, markdownText) {
+  importMarkdownIntoExistingDocumentWithDocsApi_(targetDocumentId, markdownText)
+}
+
+function markdownFromDocsApiDocument_(doc) {
+  const content = (doc && doc.body && doc.body.content) || []
+  const lines = []
+
+  for (let i = 0; i < content.length; i++) {
+    const block = content[i]
+    if (!block || !block.paragraph) continue
+    lines.push(markdownLineFromParagraph_(block.paragraph))
+  }
+
+  return lines.join('\n')
+}
+
+function markdownLineFromParagraph_(paragraph) {
+  const paragraphText = markdownTextFromParagraphElements_(paragraph.elements || [])
+  const headingPrefix = markdownHeadingPrefixFromParagraph_(paragraph)
+  const listPrefix = markdownListPrefixFromParagraph_(paragraph)
+  return headingPrefix + listPrefix + paragraphText
+}
+
+function markdownHeadingPrefixFromParagraph_(paragraph) {
+  const style = paragraph && paragraph.paragraphStyle
+  const type = style && style.namedStyleType
+  const m = /^HEADING_(\d)$/.exec(String(type || ''))
+  if (!m) return ''
+  const level = Math.max(1, Math.min(6, Number(m[1]) || 1))
+  return '#'.repeat(level) + ' '
+}
+
+function markdownListPrefixFromParagraph_(paragraph) {
+  if (!paragraph || !paragraph.bullet) return ''
+  return '- '
+}
+
+function markdownTextFromParagraphElements_(elements) {
+  let out = ''
+  for (let i = 0; i < elements.length; i++) {
+    const el = elements[i]
+    if (!el || !el.textRun) continue
+    const run = el.textRun
+    const raw = String(run.content || '').replace(/\n/g, '')
+    const escaped = escapeMarkdownLiteralText_(raw)
+    out += applyMarkdownInlineStyle_(escaped, run.textStyle || {})
+  }
+  return out
+}
+
+function escapeMarkdownLiteralText_(text) {
+  return String(text).replace(/\\/g, '\\\\').replace(/\*/g, '\\*')
+}
+
+function applyMarkdownInlineStyle_(text, style) {
+  const hasBold = !!(style && style.bold)
+  const hasItalic = !!(style && style.italic)
+  if (!hasBold && !hasItalic) return text
+  if (hasBold && hasItalic) return '***' + text + '***'
+  if (hasBold) return '**' + text + '**'
+  return '*' + text + '*'
+}
+
+function importMarkdownIntoExistingDocumentWithDocsApi_(targetDocumentId, markdownText) {
+  const parsed = parseMarkdownDocumentForDocsApi_(String(markdownText || ''))
+  clearDocumentViaDocsApi_(targetDocumentId)
+
+  if (parsed.text.length > 0) {
+    docsApiBatchUpdate_(targetDocumentId, [
+      {
+        insertText: {
+          location: { index: 1 },
+          text: parsed.text,
+        },
+      },
+    ])
+  }
+
+  const requests = []
+
+  for (let i = 0; i < parsed.lines.length; i++) {
+    const line = parsed.lines[i]
+    const paragraphStart = line.start + 1
+    const paragraphEnd = paragraphStart + line.text.length + 1
+
+    if (line.headingLevel > 0) {
+      requests.push({
+        updateParagraphStyle: {
+          range: { startIndex: paragraphStart, endIndex: paragraphEnd },
+          paragraphStyle: {
+            namedStyleType: 'HEADING_' + line.headingLevel,
+          },
+          fields: 'namedStyleType',
+        },
+      })
+    }
+
+    if (line.isList && line.text.length > 0) {
+      requests.push({
+        createParagraphBullets: {
+          range: { startIndex: paragraphStart, endIndex: paragraphEnd },
+          bulletPreset: line.listType === 'ordered' ? 'NUMBERED_DECIMAL_NESTED' : 'BULLET_DISC_CIRCLE_SQUARE',
+        },
+      })
+    }
+
+    for (let j = 0; j < line.styles.length; j++) {
+      const span = line.styles[j]
+      const startIndex = paragraphStart + span.start
+      const endIndex = startIndex + span.length
+      if (endIndex <= startIndex) continue
+
+      const style = {}
+      const fields = []
+      if (span.bold) {
+        style.bold = true
+        fields.push('bold')
+      }
+      if (span.italic) {
+        style.italic = true
+        fields.push('italic')
+      }
+      if (fields.length === 0) continue
+
+      requests.push({
+        updateTextStyle: {
+          range: { startIndex, endIndex },
+          textStyle: style,
+          fields: fields.join(','),
+        },
+      })
+    }
+  }
+
+  if (requests.length > 0) {
+    docsApiBatchUpdate_(targetDocumentId, requests)
+  }
+}
+
+function parseMarkdownDocumentForDocsApi_(markdownText) {
+  const src = String(markdownText || '').replace(/\r\n/g, '\n')
+  const srcLines = src.split('\n')
+  const lines = []
+  const outLines = []
+  let offset = 0
+
+  for (let i = 0; i < srcLines.length; i++) {
+    const parsedLine = parseMarkdownLineForDocsApi_(srcLines[i])
+    lines.push({
+      start: offset,
+      text: parsedLine.text,
+      headingLevel: parsedLine.headingLevel,
+      isList: parsedLine.isList,
+      listType: parsedLine.listType,
+      styles: parsedLine.styles,
+    })
+    outLines.push(parsedLine.text)
+    offset += parsedLine.text.length + 1
+  }
+
+  return {
+    text: outLines.join('\n'),
+    lines,
+  }
+}
+
+function parseMarkdownLineForDocsApi_(line) {
+  const headingMatch = /^(#{1,6})\s+(.*)$/.exec(line)
+  if (headingMatch) {
+    const inline = parseInlineMarkdownForDocsApi_(headingMatch[2])
+    return {
+      text: inline.text,
+      styles: inline.styles,
+      headingLevel: headingMatch[1].length,
+      isList: false,
+      listType: null,
+    }
+  }
+
+  const unorderedMatch = /^\s*[-*+]\s+(.*)$/.exec(line)
+  if (unorderedMatch) {
+    const inline = parseInlineMarkdownForDocsApi_(unorderedMatch[1])
+    return {
+      text: inline.text,
+      styles: inline.styles,
+      headingLevel: 0,
+      isList: true,
+      listType: 'unordered',
+    }
+  }
+
+  const orderedMatch = /^\s*\d+\.\s+(.*)$/.exec(line)
+  if (orderedMatch) {
+    const inline = parseInlineMarkdownForDocsApi_(orderedMatch[1])
+    return {
+      text: inline.text,
+      styles: inline.styles,
+      headingLevel: 0,
+      isList: true,
+      listType: 'ordered',
+    }
+  }
+
+  const inline = parseInlineMarkdownForDocsApi_(line)
+  return {
+    text: inline.text,
+    styles: inline.styles,
+    headingLevel: 0,
+    isList: false,
+    listType: null,
+  }
+}
+
+function parseInlineMarkdownForDocsApi_(content) {
+  let i = 0
+  let plain = ''
+  let bold = false
+  let italic = false
+  let runStart = 0
+  const styles = []
+
+  function pushStyleSegment(endExclusive) {
+    const length = endExclusive - runStart
+    if (length <= 0) return
+    if (!bold && !italic) return
+    styles.push({ start: runStart, length, bold, italic })
+  }
+
+  while (i < content.length) {
+    const ch = content.charAt(i)
+    const next = content.charAt(i + 1)
+
+    if (ch === '\\' && (next === '*' || next === '\\')) {
+      plain += next
+      i += 2
+      continue
+    }
+
+    if (ch === '*' && next === '*') {
+      pushStyleSegment(plain.length)
+      runStart = plain.length
+      bold = !bold
+      i += 2
+      continue
+    }
+
+    if (ch === '*') {
+      pushStyleSegment(plain.length)
+      runStart = plain.length
+      italic = !italic
+      i += 1
+      continue
+    }
+
+    plain += ch
+    i += 1
+  }
+
+  pushStyleSegment(plain.length)
+  return { text: plain, styles }
+}
+
+function clearDocumentViaDocsApi_(documentId) {
+  const doc = docsApiGetDocument_(documentId)
+  const content = (doc && doc.body && doc.body.content) || []
+  const last = content.length > 0 ? content[content.length - 1] : null
+  const endIndex = last && last.endIndex ? last.endIndex : 1
+
+  if (endIndex > 2) {
+    docsApiBatchUpdate_(documentId, [
+      {
+        deleteContentRange: {
+          range: {
+            startIndex: 1,
+            endIndex: endIndex - 1,
+          },
+        },
+      },
+    ])
+  }
+}
+
+function docsApiGetDocument_(documentId) {
+  return docsApiRequest_('get', 'documents/' + encodeURIComponent(documentId))
+}
+
+function docsApiBatchUpdate_(documentId, requests) {
+  return docsApiRequest_('post', 'documents/' + encodeURIComponent(documentId) + ':batchUpdate', { requests })
+}
+
+function docsApiRequest_(method, path, payload) {
+  const url = 'https://docs.googleapis.com/v1/' + path
+  const params = {
+    method: String(method || 'get').toUpperCase(),
+    headers: {
+      authorization: 'Bearer ' + ScriptApp.getOAuthToken(),
+    },
+    muteHttpExceptions: true,
+  }
+
+  if (payload !== undefined) {
+    params.contentType = 'application/json'
+    params.payload = JSON.stringify(payload)
+  }
+
+  const response = UrlFetchApp.fetch(url, params)
+  const status = response.getResponseCode()
+  const body = response.getContentText() || ''
+
+  if (status < 200 || status >= 300) {
+    throw new Error('Docs API request failed (' + status + '): ' + body)
+  }
+
+  if (!body) return {}
+  try {
+    return JSON.parse(body)
+  } catch (_) {
+    return {}
+  }
+}
+
+function applyPatchToText_(text, patch, dmp) {
+  const patches = dmp.patch_fromText(patch)
+  const result = dmp.patch_apply(patches, text)
+  return [result[0], patches, result[1]]
 }
 
 function getFiles(limit=10){

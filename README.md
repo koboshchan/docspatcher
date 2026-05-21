@@ -18,7 +18,12 @@ This project connects Google Apps Script to a local MCP server over WebSocket so
 
    PORT=3000 BRIDGE_TOKEN=dev-token npm start
 
-3. Deploy `patch.gs` as a Google Apps Script Web App. in https://script.google.com/home/projects/create
+3. Deploy `patch.gs` as a Google Apps Script Web App. 
+
+   1. In https://script.google.com/home/projects/create
+   2. Copy-paste the contents of `patch.gs` into the script editor.
+   3. Add Drive v3 and Docs v1 APIs in "Services".
+   4. Deploy as Web App: Deploy > New deployment > Select type "Web app" > Set "Who has access" to "Only Myself" > Set "Execute as" to "Me" > Deploy and note the URL.
 
 4. Open the web app URL with bridge params:
 

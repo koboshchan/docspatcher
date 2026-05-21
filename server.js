@@ -48,14 +48,15 @@ mcpServer.tool(
 
 mcpServer.tool(
   'getcontents',
-  'Read document text by file `id`. Supports chunked reads with optional 1-based `startLine` and `endLine`.',
+  'Read document content by file `id`. Supports chunked reads with optional 1-based `startLine` and `endLine`, and `format` (`text` or `markdown`).',
   {
     id: z.string().min(1),
     startLine: z.number().int().min(1).optional(),
     endLine: z.number().int().min(1).optional(),
+    format: z.enum(['text', 'markdown']).default('text'),
   },
-  async ({ id, startLine, endLine }) => {
-    const result = await bridge.call('getcontents', { id, startLine, endLine })
+  async ({ id, startLine, endLine, format }) => {
+    const result = await bridge.call('getcontents', { id, startLine, endLine, format })
     const structuredContent =
       result && typeof result === 'object' && !Array.isArray(result)
         ? result
@@ -70,14 +71,15 @@ mcpServer.tool(
 
 mcpServer.tool(
   'applypatch',
-  'Apply a patch to a Google Doc. Args: `id`, `patch`, optional `algorithm` (`unified` default or `dmp`). Unified syntax uses hunks like `@@ -oldStart,oldCount +newStart,newCount @@` with context lines prefixed by space, removals with `-`, and additions with `+`.',
+  'Apply a patch to a Google Doc. Args: `id`, `patch`, optional `algorithm` (`unified` default or `dmp`), optional `format` (`text` or `markdown`). Unified syntax uses hunks like `@@ -oldStart,oldCount +newStart,newCount @@` with context lines prefixed by space, removals with `-`, and additions with `+`.',
   {
     id: z.string().min(1),
     patch: z.string().min(1),
     algorithm: z.enum(['unified', 'dmp']).default('unified'),
+    format: z.enum(['text', 'markdown']).default('text'),
   },
-  async ({ id, patch, algorithm }) => {
-    const result = await bridge.call('applypatch', { id, patch, algorithm })
+  async ({ id, patch, algorithm, format }) => {
+    const result = await bridge.call('applypatch', { id, patch, algorithm, format })
     return {
       content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
     }
