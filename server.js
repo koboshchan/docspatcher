@@ -56,10 +56,14 @@ mcpServer.tool(
   },
   async ({ id, startLine, endLine }) => {
     const result = await bridge.call('getcontents', { id, startLine, endLine })
-    const text = typeof result?.text === 'string' ? result.text : ''
+    const structuredContent =
+      result && typeof result === 'object' && !Array.isArray(result)
+        ? result
+        : { text: typeof result === 'string' ? result : '' }
+    const text = typeof structuredContent.text === 'string' ? structuredContent.text : ''
     return {
       content: [{ type: 'text', text }],
-      structuredContent: result,
+      structuredContent,
     }
   }
 )
