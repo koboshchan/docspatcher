@@ -95,6 +95,7 @@ app.get('/health', (_req, res) => {
 })
 
 app.post('/mcp', async (req, res) => {
+  req.headers.accept = 'application/json, text/event-stream'
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
   })

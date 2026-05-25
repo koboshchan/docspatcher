@@ -261,14 +261,17 @@ function applyPatchToDocument(id, patchText, algorithm, format) {
     if (mode === 'unified') {
       const hunks = parseUnifiedHunks_(patchText)
       const unifiedResult = applyUnifiedHunksToText_(markdown, hunks)
-      text2 = unifiedResult[0]
+      const dmpApplied = applyTextTransitionWithDmpString_(markdown, unifiedResult[0], dmp)
+      text2 = dmpApplied.text
       results = unifiedResult[1]
+      var dmpResults = dmpApplied.results
       patchesOrHunks = hunks
     } else {
       const dmpResult = applyPatchToText_(markdown, patchText, dmp)
       text2 = dmpResult[0]
       patchesOrHunks = dmpResult[1]
       results = dmpResult[2]
+      var dmpResults = dmpResult[2]
     }
 
     importMarkdownIntoExistingDocument_(id, text2)
@@ -277,6 +280,7 @@ function applyPatchToDocument(id, patchText, algorithm, format) {
       format: 'markdown',
       patches: patchesOrHunks.length,
       results,
+      dmpResults,
       textLength: text2.length,
     }
   }
@@ -285,12 +289,13 @@ function applyPatchToDocument(id, patchText, algorithm, format) {
   const doctext = body.editAsText()
 
   if (mode === 'unified') {
-    const [text2, hunks, results] = applyUnifiedPatch(doctext, patchText, dmp)
+    const [text2, hunks, results, dmpResults] = applyUnifiedPatch(doctext, patchText, dmp)
     return {
       algorithm: 'unified',
       format: 'text',
       patches: hunks.length,
       results,
+      dmpResults,
       textLength: text2.length,
     }
   }
@@ -734,12 +739,23 @@ function applyPatch(doctext, patch, dmp) {
 function applyUnifiedPatch(doctext, patchText, dmp) {
   const text = doctext.getText()
   const hunks = parseUnifiedHunks_(patchText)
-  const [text2, results] = applyUnifiedHunksToText_(text, hunks)
+  const [targetText, results] = applyUnifiedHunksToText_(text, hunks)
+  const dmpApplied = applyTextTransitionWithDmpToDocument_(doctext, text, targetText, dmp)
 
-  const diffs = dmp.diff_main(text, text2, false)
+  return [dmpApplied.text, hunks, results, dmpApplied.results]
+}
+
+function applyTextTransitionWithDmpString_(fromText, toText, dmp) {
+  const patches = dmp.patch_make(fromText, toText)
+  const applied = dmp.patch_apply(patches, fromText)
+  return { text: applied[0], results: applied[1] }
+}
+
+function applyTextTransitionWithDmpToDocument_(doctext, fromText, toText, dmp) {
+  const applied = applyTextTransitionWithDmpString_(fromText, toText, dmp)
+  const diffs = dmp.diff_main(fromText, applied.text, false)
   applyDiffsPreservingStyles(doctext, diffs)
-
-  return [text2, hunks, results]
+  return applied
 }
 
 function parseUnifiedHunks_(patchText) {
