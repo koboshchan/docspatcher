@@ -330,11 +330,69 @@ function markdownFromDocsApiDocument_(doc) {
 
   for (let i = 0; i < content.length; i++) {
     const block = content[i]
-    if (!block || !block.paragraph) continue
-    lines.push(markdownLineFromParagraph_(block.paragraph))
+    if (!block) continue
+
+    if (block.paragraph) {
+      lines.push(markdownLineFromParagraph_(block.paragraph))
+      continue
+    }
+
+    if (block.table) {
+      const tableLines = markdownLinesFromTable_(block.table)
+      if (lines.length > 0 && lines[lines.length - 1] !== '') lines.push('')
+      for (let t = 0; t < tableLines.length; t++) lines.push(tableLines[t])
+      if (i < content.length - 1) lines.push('')
+    }
   }
 
   return lines.join('\n')
+}
+
+function markdownLinesFromTable_(table) {
+  const rows = (table && table.tableRows) || []
+  if (rows.length === 0) return []
+
+  const parsedRows = []
+  let maxCols = 0
+
+  for (let r = 0; r < rows.length; r++) {
+    const cells = rows[r].tableCells || []
+    const parsedRow = []
+    for (let c = 0; c < cells.length; c++) {
+      parsedRow.push(markdownTextFromTableCell_(cells[c]))
+    }
+    if (parsedRow.length > maxCols) maxCols = parsedRow.length
+    parsedRows.push(parsedRow)
+  }
+
+  if (maxCols === 0) return []
+
+  for (let r = 0; r < parsedRows.length; r++) {
+    while (parsedRows[r].length < maxCols) parsedRows[r].push('')
+  }
+
+  const lines = []
+  lines.push('| ' + parsedRows[0].join(' | ') + ' |')
+  lines.push('| ' + Array(maxCols).fill(':----').join(' | ') + ' |')
+
+  for (let r = 1; r < parsedRows.length; r++) {
+    lines.push('| ' + parsedRows[r].join(' | ') + ' |')
+  }
+
+  return lines
+}
+
+function markdownTextFromTableCell_(cell) {
+  const content = (cell && cell.content) || []
+  const segments = []
+
+  for (let i = 0; i < content.length; i++) {
+    const block = content[i]
+    if (!block || !block.paragraph) continue
+    segments.push(markdownTextFromParagraphElements_(block.paragraph.elements || []))
+  }
+
+  return segments.join('<br>').replace(/\|/g, '\\|')
 }
 
 function markdownLineFromParagraph_(paragraph) {
@@ -385,6 +443,11 @@ function applyMarkdownInlineStyle_(text, style) {
 }
 
 function importMarkdownIntoExistingDocumentWithDocsApi_(targetDocumentId, markdownText) {
+  if (containsMarkdownTableSyntax_(markdownText)) {
+    importMarkdownIntoExistingDocumentWithDocumentApp_(targetDocumentId, markdownText)
+    return
+  }
+
   const parsed = parseMarkdownDocumentForDocsApi_(String(markdownText || ''))
   clearDocumentViaDocsApi_(targetDocumentId)
 
@@ -458,6 +521,160 @@ function importMarkdownIntoExistingDocumentWithDocsApi_(targetDocumentId, markdo
   if (requests.length > 0) {
     docsApiBatchUpdate_(targetDocumentId, requests)
   }
+}
+
+function importMarkdownIntoExistingDocumentWithDocumentApp_(targetDocumentId, markdownText) {
+  const doc = DocumentApp.openById(targetDocumentId)
+  const body = doc.getBody()
+  body.clear()
+
+  const blocks = parseMarkdownBlocksForDocumentApp_(String(markdownText || ''))
+
+  for (let i = 0; i < blocks.length; i++) {
+    const block = blocks[i]
+
+    if (block.type === 'table') {
+      const table = body.appendTable(block.rows.map((row) => row.map((cell) => cell.text)))
+      for (let r = 0; r < block.rows.length; r++) {
+        for (let c = 0; c < block.rows[r].length; c++) {
+          const cellSpec = block.rows[r][c]
+          applyInlineStylesToTextElement_(table.getCell(r, c).editAsText(), cellSpec.styles)
+        }
+      }
+      continue
+    }
+
+    const line = parseMarkdownLineForDocsApi_(block.text)
+    let element
+    if (line.isList) {
+      element = body.appendListItem(line.text)
+    } else {
+      element = body.appendParagraph(line.text)
+      if (line.headingLevel > 0) {
+        const heading = 'HEADING_' + line.headingLevel
+        if (DocumentApp.ParagraphHeading[heading]) {
+          element.setHeading(DocumentApp.ParagraphHeading[heading])
+        }
+      }
+    }
+
+    applyInlineStylesToTextElement_(element.editAsText(), line.styles)
+  }
+}
+
+function parseMarkdownBlocksForDocumentApp_(markdownText) {
+  const lines = String(markdownText || '').replace(/\r\n/g, '\n').split('\n')
+  const blocks = []
+  let i = 0
+
+  while (i < lines.length) {
+    const line = lines[i]
+
+    if (isMarkdownTableRowLine_(line) && i + 1 < lines.length && isMarkdownTableSeparatorLine_(lines[i + 1])) {
+      const tableLines = [line]
+      i += 2
+
+      while (i < lines.length && isMarkdownTableRowLine_(lines[i])) {
+        tableLines.push(lines[i])
+        i++
+      }
+
+      const rows = parseMarkdownTableRows_(tableLines)
+      if (rows.length > 0) {
+        blocks.push({ type: 'table', rows })
+      }
+      continue
+    }
+
+    blocks.push({ type: 'paragraph', text: line })
+    i++
+  }
+
+  return blocks
+}
+
+function isMarkdownTableRowLine_(line) {
+  return /^\s*\|.*\|\s*$/.test(String(line || ''))
+}
+
+function isMarkdownTableSeparatorLine_(line) {
+  return /^\s*\|\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|\s*$/.test(String(line || ''))
+}
+
+function parseMarkdownTableRows_(tableLines) {
+  const rows = []
+  let maxCols = 0
+
+  for (let i = 0; i < tableLines.length; i++) {
+    const cellsRaw = splitMarkdownTableRowCells_(tableLines[i])
+    const cells = []
+    for (let c = 0; c < cellsRaw.length; c++) {
+      const inline = parseInlineMarkdownForDocsApi_(cellsRaw[c].replace(/<br\s*\/?\s*>/gi, '\n'))
+      cells.push({ text: inline.text, styles: inline.styles })
+    }
+    if (cells.length > maxCols) maxCols = cells.length
+    rows.push(cells)
+  }
+
+  for (let r = 0; r < rows.length; r++) {
+    while (rows[r].length < maxCols) {
+      rows[r].push({ text: '', styles: [] })
+    }
+  }
+
+  return rows
+}
+
+function splitMarkdownTableRowCells_(line) {
+  const raw = String(line || '').trim().replace(/^\|/, '').replace(/\|$/, '')
+  const parts = []
+  let cur = ''
+  let escaping = false
+
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw.charAt(i)
+    if (escaping) {
+      cur += ch
+      escaping = false
+      continue
+    }
+    if (ch === '\\') {
+      escaping = true
+      continue
+    }
+    if (ch === '|') {
+      parts.push(cur.trim())
+      cur = ''
+      continue
+    }
+    cur += ch
+  }
+  parts.push(cur.trim())
+
+  return parts
+}
+
+function applyInlineStylesToTextElement_(textElement, styles) {
+  if (!textElement || !styles || styles.length === 0) return
+  for (let i = 0; i < styles.length; i++) {
+    const span = styles[i]
+    const start = span.start
+    const end = span.start + span.length - 1
+    if (end < start) continue
+    if (span.bold) textElement.setBold(start, end, true)
+    if (span.italic) textElement.setItalic(start, end, true)
+  }
+}
+
+function containsMarkdownTableSyntax_(markdownText) {
+  const lines = String(markdownText || '').split(/\r?\n/)
+  for (let i = 0; i < lines.length - 1; i++) {
+    if (!/^\s*\|.*\|\s*$/.test(lines[i])) continue
+    if (/^\s*\|\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|\s*$/.test(lines[i + 1])) {
+      return true
+    }
+  }
+  return false
 }
 
 function parseMarkdownDocumentForDocsApi_(markdownText) {
