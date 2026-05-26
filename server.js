@@ -48,7 +48,7 @@ mcpServer.tool(
 
 mcpServer.tool(
   'getcontents',
-  'Read document content by file `id` in the custom markdown format only. Supports chunked reads with optional 1-based `startLine` and `endLine`. Headings are supported from `#` to `####`. Inline styles may include `**bold**`, `*italic*`, `{u}...{/u}`, `{color:#rrggbb}...{/color}`, and `{size:N}...{/size}` (font size in points). List nesting is exported with leading tabs; unordered list items use `* ` and ordered list items use `N. `.',
+  'Read document content by file `id` in the custom markdown format only. Supports chunked reads with optional 1-based `startLine` and `endLine`. Returns document metadata including `title`, `lastEditedMs`, and `lastEditedIso`. Headings are supported from `#` to `####`. Inline styles may include `**bold**`, `*italic*`, `{u}...{/u}`, `{color:#rrggbb}...{/color}`, and `{size:N}...{/size}` (font size in points). List nesting is exported with leading tabs; unordered list items use `* ` and ordered list items use `N. `.',
   {
     id: z.string().min(1),
     startLine: z.number().int().min(1).optional(),

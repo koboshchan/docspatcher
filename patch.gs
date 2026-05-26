@@ -218,6 +218,7 @@ function mcp_applyPatch(id, patchText, algorithm, format) {
 
 function getContents(id, startLine, endLine, format) {
   const normalizedFormat = normalizeContentFormat_(format)
+  const docInfo = getDocumentInfo_(id)
   const text = exportDocumentAsMarkdown_(id)
   const lines = text.split('\n')
   const totalLines = lines.length
@@ -226,6 +227,10 @@ function getContents(id, startLine, endLine, format) {
   const end = Math.min(totalLines, Number(endLine) || totalLines)
   if (start > end) {
     return {
+      id,
+      title: docInfo.title,
+      lastEditedMs: docInfo.lastEditedMs,
+      lastEditedIso: docInfo.lastEditedIso,
       startLine: start,
       endLine: end,
       totalLines,
@@ -235,12 +240,26 @@ function getContents(id, startLine, endLine, format) {
   }
 
   return {
+    id,
+    title: docInfo.title,
+    lastEditedMs: docInfo.lastEditedMs,
+    lastEditedIso: docInfo.lastEditedIso,
     format: normalizedFormat,
     startLine: start,
     endLine: end,
     totalLines,
     hasMore: end < totalLines,
     text: lines.slice(start - 1, end).join('\n'),
+  }
+}
+
+function getDocumentInfo_(id) {
+  const file = DriveApp.getFileById(id)
+  const lastEdited = file.getLastUpdated()
+  return {
+    title: file.getName(),
+    lastEditedMs: lastEdited.getTime(),
+    lastEditedIso: lastEdited.toISOString(),
   }
 }
 
