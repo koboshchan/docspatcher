@@ -326,6 +326,8 @@ function importMarkdownIntoExistingDocument_(targetDocumentId, markdownText) {
 
 function markdownFromDocsApiDocument_(doc) {
   const content = (doc && doc.body && doc.body.content) || []
+  const listsById = (doc && doc.lists) || {}
+  const listState = { counters: {} }
   const lines = []
 
   for (let i = 0; i < content.length; i++) {
@@ -333,7 +335,7 @@ function markdownFromDocsApiDocument_(doc) {
     if (!block) continue
 
     if (block.paragraph) {
-      lines.push(markdownLineFromParagraph_(block.paragraph))
+      lines.push(markdownLineFromParagraph_(block.paragraph, listsById, listState))
       continue
     }
 
@@ -395,10 +397,10 @@ function markdownTextFromTableCell_(cell) {
   return segments.join('<br>').replace(/\|/g, '\\|')
 }
 
-function markdownLineFromParagraph_(paragraph) {
+function markdownLineFromParagraph_(paragraph, listsById, listState) {
   const paragraphText = markdownTextFromParagraphElements_(paragraph.elements || [])
   const headingPrefix = markdownHeadingPrefixFromParagraph_(paragraph)
-  const listPrefix = markdownListPrefixFromParagraph_(paragraph)
+  const listPrefix = markdownListPrefixFromParagraph_(paragraph, listsById, listState)
   return headingPrefix + listPrefix + paragraphText
 }
 
@@ -411,9 +413,37 @@ function markdownHeadingPrefixFromParagraph_(paragraph) {
   return '#'.repeat(level) + ' '
 }
 
-function markdownListPrefixFromParagraph_(paragraph) {
+function markdownListPrefixFromParagraph_(paragraph, listsById, listState) {
   if (!paragraph || !paragraph.bullet) return ''
-  return '- '
+
+  const listId = paragraph.bullet.listId || 'default'
+  const level = Math.max(0, Number(paragraph.bullet.nestingLevel) || 0)
+  const indent = '\t'.repeat(level)
+  const ordered = isOrderedListParagraph_(paragraph, listsById)
+
+  if (!ordered) return indent + '* '
+
+  const key = listId + ':' + level
+  const current = Number(listState && listState.counters && listState.counters[key]) || 0
+  const next = current + 1
+  if (listState && listState.counters) listState.counters[key] = next
+  return indent + next + '. '
+}
+
+function isOrderedListParagraph_(paragraph, listsById) {
+  if (!paragraph || !paragraph.bullet) return false
+
+  const listId = paragraph.bullet.listId
+  const level = Math.max(0, Number(paragraph.bullet.nestingLevel) || 0)
+  const list = listId && listsById && listsById[listId]
+  const nesting =
+    list &&
+    list.listProperties &&
+    list.listProperties.nestingLevels &&
+    list.listProperties.nestingLevels[level]
+  const glyphType = String(nesting && nesting.glyphType ? nesting.glyphType : '')
+
+  return /DECIMAL|ALPHA|ROMAN|NUMBER/i.test(glyphType)
 }
 
 function markdownTextFromParagraphElements_(elements) {
@@ -430,16 +460,65 @@ function markdownTextFromParagraphElements_(elements) {
 }
 
 function escapeMarkdownLiteralText_(text) {
-  return String(text).replace(/\\/g, '\\\\').replace(/\*/g, '\\*')
+  return String(text)
+    .replace(/\\/g, '\\\\')
+    .replace(/\*/g, '\\*')
+    .replace(/\{/g, '\\{')
+    .replace(/\}/g, '\\}')
 }
 
 function applyMarkdownInlineStyle_(text, style) {
   const hasBold = !!(style && style.bold)
   const hasItalic = !!(style && style.italic)
-  if (!hasBold && !hasItalic) return text
-  if (hasBold && hasItalic) return '***' + text + '***'
-  if (hasBold) return '**' + text + '**'
-  return '*' + text + '*'
+  const hasUnderline = !!(style && style.underline)
+  const color = getHexColorFromTextStyle_(style)
+  const size = getFontSizeFromTextStyle_(style)
+
+  let out = text
+  if (hasBold && hasItalic) out = '***' + out + '***'
+  else if (hasBold) out = '**' + out + '**'
+  else if (hasItalic) out = '*' + out + '*'
+  if (hasUnderline) out = '{u}' + out + '{/u}'
+
+  if (size) out = '{size:' + size + '}' + out + '{/size}'
+  if (color) out = '{color:' + color + '}' + out + '{/color}'
+  return out
+}
+
+function getHexColorFromTextStyle_(style) {
+  const foreground = style && style.foregroundColor
+  const rgb =
+    (foreground && foreground.color && foreground.color.rgbColor) ||
+    (foreground && foreground.opaqueColor && foreground.opaqueColor.rgbColor) ||
+    (foreground && foreground.rgbColor)
+  if (!rgb) return null
+
+  function toHexChannel_(n) {
+    const v = Math.max(0, Math.min(255, Math.round((Number(n) || 0) * 255)))
+    const h = v.toString(16)
+    return h.length === 1 ? '0' + h : h
+  }
+
+  return (
+    '#' +
+    toHexChannel_(rgb.red) +
+    toHexChannel_(rgb.green) +
+    toHexChannel_(rgb.blue)
+  )
+}
+
+function getFontSizeFromTextStyle_(style) {
+  const fs = style && style.fontSize
+  if (!fs) return null
+
+  if (typeof fs === 'number') {
+    if (fs <= 0) return null
+    return Math.round(fs)
+  }
+
+  const magnitude = Number(fs.magnitude)
+  if (!(magnitude > 0)) return null
+  return Math.round(magnitude)
 }
 
 function importMarkdownIntoExistingDocumentWithDocsApi_(targetDocumentId, markdownText) {
@@ -506,6 +585,21 @@ function importMarkdownIntoExistingDocumentWithDocsApi_(targetDocumentId, markdo
         style.italic = true
         fields.push('italic')
       }
+      if (span.underline) {
+        style.underline = true
+        fields.push('underline')
+      }
+      if (span.foregroundColor) {
+        const rgb = hexToRgbColor_(span.foregroundColor)
+        if (rgb) {
+          style.foregroundColor = { color: { rgbColor: rgb } }
+          fields.push('foregroundColor')
+        }
+      }
+      if (span.fontSize) {
+        style.fontSize = { magnitude: Number(span.fontSize), unit: 'PT' }
+        fields.push('fontSize')
+      }
       if (fields.length === 0) continue
 
       requests.push({
@@ -548,6 +642,9 @@ function importMarkdownIntoExistingDocumentWithDocumentApp_(targetDocumentId, ma
     let element
     if (line.isList) {
       element = body.appendListItem(line.text)
+      if (line.nestingLevel > 0) {
+        element.setNestingLevel(line.nestingLevel)
+      }
     } else {
       element = body.appendParagraph(line.text)
       if (line.headingLevel > 0) {
@@ -663,6 +760,9 @@ function applyInlineStylesToTextElement_(textElement, styles) {
     if (end < start) continue
     if (span.bold) textElement.setBold(start, end, true)
     if (span.italic) textElement.setItalic(start, end, true)
+    if (span.underline) textElement.setUnderline(start, end, true)
+    if (span.foregroundColor) textElement.setForegroundColor(start, end, span.foregroundColor)
+    if (span.fontSize) textElement.setFontSize(start, end, Number(span.fontSize))
   }
 }
 
@@ -686,22 +786,39 @@ function parseMarkdownDocumentForDocsApi_(markdownText) {
 
   for (let i = 0; i < srcLines.length; i++) {
     const parsedLine = parseMarkdownLineForDocsApi_(srcLines[i])
+    const nestingTabs = parsedLine.isList ? '\t'.repeat(parsedLine.nestingLevel || 0) : ''
+    const lineText = nestingTabs + parsedLine.text
     lines.push({
       start: offset,
-      text: parsedLine.text,
+      text: lineText,
       headingLevel: parsedLine.headingLevel,
       isList: parsedLine.isList,
       listType: parsedLine.listType,
-      styles: parsedLine.styles,
+      styles: shiftStyles_(parsedLine.styles, nestingTabs.length),
+      nestingLevel: parsedLine.nestingLevel || 0,
     })
-    outLines.push(parsedLine.text)
-    offset += parsedLine.text.length + 1
+    outLines.push(lineText)
+    offset += lineText.length + 1
   }
 
   return {
     text: outLines.join('\n'),
     lines,
   }
+}
+
+function shiftStyles_(styles, offset) {
+  const delta = Number(offset) || 0
+  if (!styles || styles.length === 0 || delta === 0) return styles || []
+  const out = []
+  for (let i = 0; i < styles.length; i++) {
+    const s = styles[i]
+    const next = {}
+    for (const key in s) next[key] = s[key]
+    next.start = (Number(s.start) || 0) + delta
+    out.push(next)
+  }
+  return out
 }
 
 function parseMarkdownLineForDocsApi_(line) {
@@ -719,25 +836,33 @@ function parseMarkdownLineForDocsApi_(line) {
 
   const unorderedMatch = /^\s*[-*+]\s+(.*)$/.exec(line)
   if (unorderedMatch) {
-    const inline = parseInlineMarkdownForDocsApi_(unorderedMatch[1])
+    const detailed = /^([ \t]*)[-*+]\s+(.*)$/.exec(line)
+    const leading = detailed ? detailed[1] : ''
+    const content = detailed ? detailed[2] : unorderedMatch[1]
+    const inline = parseInlineMarkdownForDocsApi_(content)
     return {
       text: inline.text,
       styles: inline.styles,
       headingLevel: 0,
       isList: true,
       listType: 'unordered',
+      nestingLevel: listNestingLevelFromLeading_(leading),
     }
   }
 
   const orderedMatch = /^\s*\d+\.\s+(.*)$/.exec(line)
   if (orderedMatch) {
-    const inline = parseInlineMarkdownForDocsApi_(orderedMatch[1])
+    const detailed = /^([ \t]*)\d+\.\s+(.*)$/.exec(line)
+    const leading = detailed ? detailed[1] : ''
+    const content = detailed ? detailed[2] : orderedMatch[1]
+    const inline = parseInlineMarkdownForDocsApi_(content)
     return {
       text: inline.text,
       styles: inline.styles,
       headingLevel: 0,
       isList: true,
       listType: 'ordered',
+      nestingLevel: listNestingLevelFromLeading_(leading),
     }
   }
 
@@ -748,7 +873,30 @@ function parseMarkdownLineForDocsApi_(line) {
     headingLevel: 0,
     isList: false,
     listType: null,
+    nestingLevel: 0,
   }
+}
+
+function listNestingLevelFromLeading_(leading) {
+  const text = String(leading || '')
+  let level = 0
+  let spaces = 0
+  for (let i = 0; i < text.length; i++) {
+    const ch = text.charAt(i)
+    if (ch === '\t') {
+      level += 1
+      spaces = 0
+      continue
+    }
+    if (ch === ' ') {
+      spaces += 1
+      if (spaces >= 2) {
+        level += 1
+        spaces = 0
+      }
+    }
+  }
+  return level
 }
 
 function parseInlineMarkdownForDocsApi_(content) {
@@ -756,21 +904,77 @@ function parseInlineMarkdownForDocsApi_(content) {
   let plain = ''
   let bold = false
   let italic = false
+  let underline = false
+  let color = null
+  let size = null
   let runStart = 0
   const styles = []
 
   function pushStyleSegment(endExclusive) {
     const length = endExclusive - runStart
     if (length <= 0) return
-    if (!bold && !italic) return
-    styles.push({ start: runStart, length, bold, italic })
+    if (!bold && !italic && !underline && !color && !size) return
+    const span = { start: runStart, length, bold, italic, underline }
+    if (color) span.foregroundColor = color
+    if (size) span.fontSize = size
+    styles.push(span)
   }
 
   while (i < content.length) {
+    if (content.startsWith('{/u}', i)) {
+      pushStyleSegment(plain.length)
+      runStart = plain.length
+      underline = false
+      i += 4
+      continue
+    }
+
+    if (content.startsWith('{u}', i)) {
+      pushStyleSegment(plain.length)
+      runStart = plain.length
+      underline = true
+      i += 3
+      continue
+    }
+
+    if (content.startsWith('{/color}', i)) {
+      pushStyleSegment(plain.length)
+      runStart = plain.length
+      color = null
+      i += 8
+      continue
+    }
+
+    if (content.startsWith('{/size}', i)) {
+      pushStyleSegment(plain.length)
+      runStart = plain.length
+      size = null
+      i += 7
+      continue
+    }
+
+    const colorOpen = /^\{color:\s*(#[0-9a-fA-F]{6})\}/.exec(content.substring(i))
+    if (colorOpen) {
+      pushStyleSegment(plain.length)
+      runStart = plain.length
+      color = colorOpen[1].toLowerCase()
+      i += colorOpen[0].length
+      continue
+    }
+
+    const sizeOpen = /^\{size:\s*(\d{1,3})\}/.exec(content.substring(i))
+    if (sizeOpen) {
+      pushStyleSegment(plain.length)
+      runStart = plain.length
+      size = Math.max(1, Math.min(200, Number(sizeOpen[1]) || 11))
+      i += sizeOpen[0].length
+      continue
+    }
+
     const ch = content.charAt(i)
     const next = content.charAt(i + 1)
 
-    if (ch === '\\' && (next === '*' || next === '\\')) {
+    if (ch === '\\' && (next === '*' || next === '\\' || next === '{' || next === '}')) {
       plain += next
       i += 2
       continue
@@ -798,6 +1002,17 @@ function parseInlineMarkdownForDocsApi_(content) {
 
   pushStyleSegment(plain.length)
   return { text: plain, styles }
+}
+
+function hexToRgbColor_(hex) {
+  const m = /^#?([0-9a-fA-F]{6})$/.exec(String(hex || '').trim())
+  if (!m) return null
+  const raw = m[1]
+  return {
+    red: parseInt(raw.substring(0, 2), 16) / 255,
+    green: parseInt(raw.substring(2, 4), 16) / 255,
+    blue: parseInt(raw.substring(4, 6), 16) / 255,
+  }
 }
 
 function clearDocumentViaDocsApi_(documentId) {
