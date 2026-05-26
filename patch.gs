@@ -174,7 +174,7 @@ function buildBridgeHtml_(wsUrl, token) {
                 logLine('getcontents failure')
                 sendError(id, err && err.message)
               })
-              .mcp_getContents(params.id, params.startLine, params.endLine, params.format)
+              .mcp_getContents(params.id, params.startLine, params.endLine, params.format, params.tabId)
             return
           }
 
@@ -188,7 +188,7 @@ function buildBridgeHtml_(wsUrl, token) {
                 logLine('applypatch failure')
                 sendError(id, err && err.message)
               })
-              .mcp_applyPatch(params.id, params.patch, params.algorithm, params.format)
+              .mcp_applyPatch(params.id, params.patch, params.algorithm, params.format, params.tabId)
             return
           }
 
@@ -208,18 +208,21 @@ function mcp_searchFiles(query, limit) {
   return searchFiles(query, limit)
 }
 
-function mcp_getContents(id, startLine, endLine, format) {
-  return getContents(id, startLine, endLine, format)
+function mcp_getContents(id, startLine, endLine, format, tabId) {
+  return getContents(id, startLine, endLine, format, tabId)
 }
 
-function mcp_applyPatch(id, patchText, algorithm, format) {
-  return applyPatchToDocument(id, patchText, algorithm, format)
+function mcp_applyPatch(id, patchText, algorithm, format, tabId) {
+  return applyPatchToDocument(id, patchText, algorithm, format, tabId)
 }
 
-function getContents(id, startLine, endLine, format) {
+function getContents(id, startLine, endLine, format, tabId) {
   const normalizedFormat = normalizeContentFormat_(format)
   const docInfo = getDocumentInfo_(id)
-  const text = exportDocumentAsMarkdown_(id)
+  const doc = docsApiGetDocument_(id, true)
+  const tabContext = resolveDocTabContext_(doc, tabId)
+  const availableTabs = listAvailableTabs_(doc)
+  const text = markdownFromDocsApiDocument_(doc, tabContext)
   const lines = text.split('\n')
   const totalLines = lines.length
 
@@ -231,6 +234,9 @@ function getContents(id, startLine, endLine, format) {
       title: docInfo.title,
       lastEditedMs: docInfo.lastEditedMs,
       lastEditedIso: docInfo.lastEditedIso,
+      tabId: tabContext.tabId || null,
+      tabName: tabContext.tabName || null,
+      availableTabs,
       startLine: start,
       endLine: end,
       totalLines,
@@ -244,6 +250,9 @@ function getContents(id, startLine, endLine, format) {
     title: docInfo.title,
     lastEditedMs: docInfo.lastEditedMs,
     lastEditedIso: docInfo.lastEditedIso,
+    tabId: tabContext.tabId || null,
+    tabName: tabContext.tabName || null,
+    availableTabs,
     format: normalizedFormat,
     startLine: start,
     endLine: end,
@@ -263,11 +272,88 @@ function getDocumentInfo_(id) {
   }
 }
 
-function applyPatchToDocument(id, patchText, algorithm, format) {
+function listAvailableTabs_(doc) {
+  const out = []
+  const tabs = (doc && doc.tabs) || []
+
+  function walk(tabList, parentTabId) {
+    for (let i = 0; i < tabList.length; i++) {
+      const tab = tabList[i]
+      if (!tab) continue
+      const props = tab.tabProperties || {}
+      const id = String(props.tabId || tab.tabId || '')
+      const title = String(props.title || tab.title || '')
+      const index = Number(props.index)
+
+      out.push({
+        id: id || null,
+        title: title || null,
+        index: Number.isFinite(index) ? index : out.length,
+        parentTabId: parentTabId || null,
+      })
+
+      const children = tab.childTabs || []
+      if (children.length > 0) walk(children, id || null)
+    }
+  }
+
+  walk(tabs, null)
+  return out
+}
+
+function resolveDocTabContext_(doc, requestedTabId) {
+  const selectedTabId = String(requestedTabId || '').trim()
+  const bodyContent = (doc && doc.body && doc.body.content) || []
+  const listsById = (doc && doc.lists) || {}
+
+  if (!selectedTabId) {
+    return {
+      tabId: null,
+      tabName: null,
+      content: bodyContent,
+      listsById,
+      requestTabId: null,
+    }
+  }
+
+  const match = findTabById_((doc && doc.tabs) || [], selectedTabId)
+  if (!match) {
+    throw new Error('tabId not found: ' + selectedTabId)
+  }
+
+  const tab = match.tab
+  const props = (tab && tab.tabProperties) || {}
+  const docTab = (tab && tab.documentTab) || {}
+  return {
+    tabId: String(props.tabId || selectedTabId),
+    tabName: String(props.title || tab.title || ''),
+    content: (docTab && docTab.body && docTab.body.content) || [],
+    listsById: (docTab && docTab.lists) || listsById,
+    requestTabId: String(props.tabId || selectedTabId),
+  }
+}
+
+function findTabById_(tabs, tabId) {
+  for (let i = 0; i < tabs.length; i++) {
+    const tab = tabs[i]
+    if (!tab) continue
+    const props = tab.tabProperties || {}
+    const id = String(props.tabId || tab.tabId || '')
+    if (id === tabId) return { tab }
+    const children = tab.childTabs || []
+    const nested = findTabById_(children, tabId)
+    if (nested) return nested
+  }
+  return null
+}
+
+function applyPatchToDocument(id, patchText, algorithm, format, tabId) {
   const dmp = new diff_match_patch()
   const mode = (algorithm || 'unified').toLowerCase()
   const normalizedFormat = normalizeContentFormat_(format)
-  const markdown = exportDocumentAsMarkdown_(id)
+  const doc = docsApiGetDocument_(id, true)
+  const tabContext = resolveDocTabContext_(doc, tabId)
+  const markdown = markdownFromDocsApiDocument_(doc, tabContext)
   let text2
   let patchesOrHunks
   let results
@@ -289,10 +375,12 @@ function applyPatchToDocument(id, patchText, algorithm, format) {
     dmpResults = dmpResult[2]
   }
 
-  importMarkdownIntoExistingDocument_(id, text2)
+  importMarkdownIntoExistingDocument_(id, text2, tabContext)
   return {
     algorithm: mode === 'unified' ? 'unified' : 'dmp',
     format: normalizedFormat,
+    tabId: tabContext.tabId || null,
+    tabName: tabContext.tabName || null,
     patches: patchesOrHunks.length,
     results,
     dmpResults,
@@ -308,18 +396,20 @@ function normalizeContentFormat_(format) {
   return 'markdown'
 }
 
-function exportDocumentAsMarkdown_(documentId) {
-  const doc = docsApiGetDocument_(documentId)
-  return markdownFromDocsApiDocument_(doc)
+function exportDocumentAsMarkdown_(documentId, tabId) {
+  const doc = docsApiGetDocument_(documentId, true)
+  const tabContext = resolveDocTabContext_(doc, tabId)
+  return markdownFromDocsApiDocument_(doc, tabContext)
 }
 
-function importMarkdownIntoExistingDocument_(targetDocumentId, markdownText) {
-  importMarkdownIntoExistingDocumentWithDocsApi_(targetDocumentId, markdownText)
+function importMarkdownIntoExistingDocument_(targetDocumentId, markdownText, tabContext) {
+  importMarkdownIntoExistingDocumentWithDocsApi_(targetDocumentId, markdownText, tabContext)
 }
 
-function markdownFromDocsApiDocument_(doc) {
-  const content = (doc && doc.body && doc.body.content) || []
-  const listsById = (doc && doc.lists) || {}
+function markdownFromDocsApiDocument_(doc, tabContext) {
+  const context = tabContext || resolveDocTabContext_(doc)
+  const content = context.content || []
+  const listsById = context.listsById || {}
   const listState = { counters: {} }
   const lines = []
 
@@ -527,20 +617,24 @@ function getFontSizeFromTextStyle_(style) {
   return Math.round(magnitude)
 }
 
-function importMarkdownIntoExistingDocumentWithDocsApi_(targetDocumentId, markdownText) {
+function importMarkdownIntoExistingDocumentWithDocsApi_(targetDocumentId, markdownText, tabContext) {
   if (containsMarkdownTableSyntax_(markdownText)) {
-    importMarkdownIntoExistingDocumentWithDocumentApp_(targetDocumentId, markdownText)
+    importMarkdownIntoExistingDocumentWithDocumentApp_(targetDocumentId, markdownText, tabContext)
     return
   }
 
+  const context =
+    tabContext || resolveDocTabContext_(docsApiGetDocument_(targetDocumentId, true))
   const parsed = parseMarkdownDocumentForDocsApi_(String(markdownText || ''))
-  clearDocumentViaDocsApi_(targetDocumentId)
+  clearDocumentViaDocsApi_(targetDocumentId, context)
 
   if (parsed.text.length > 0) {
+    const location = { index: 1 }
+    if (context.requestTabId) location.tabId = context.requestTabId
     docsApiBatchUpdate_(targetDocumentId, [
       {
         insertText: {
-          location: { index: 1 },
+          location,
           text: parsed.text,
         },
       },
@@ -555,9 +649,11 @@ function importMarkdownIntoExistingDocumentWithDocsApi_(targetDocumentId, markdo
     const paragraphEnd = paragraphStart + line.text.length + 1
 
     if (line.headingLevel > 0) {
+      const range = { startIndex: paragraphStart, endIndex: paragraphEnd }
+      if (context.requestTabId) range.tabId = context.requestTabId
       requests.push({
         updateParagraphStyle: {
-          range: { startIndex: paragraphStart, endIndex: paragraphEnd },
+          range,
           paragraphStyle: {
             namedStyleType: namedStyleTypeFromHeadingLevel_(line.headingLevel),
           },
@@ -567,9 +663,11 @@ function importMarkdownIntoExistingDocumentWithDocsApi_(targetDocumentId, markdo
     }
 
     if (line.isList && line.text.length > 0) {
+      const range = { startIndex: paragraphStart, endIndex: paragraphEnd }
+      if (context.requestTabId) range.tabId = context.requestTabId
       requests.push({
         createParagraphBullets: {
-          range: { startIndex: paragraphStart, endIndex: paragraphEnd },
+          range,
           bulletPreset: line.listType === 'ordered' ? 'NUMBERED_DECIMAL_NESTED' : 'BULLET_DISC_CIRCLE_SQUARE',
         },
       })
@@ -608,9 +706,12 @@ function importMarkdownIntoExistingDocumentWithDocsApi_(targetDocumentId, markdo
       }
       if (fields.length === 0) continue
 
+      const range = { startIndex, endIndex }
+      if (context.requestTabId) range.tabId = context.requestTabId
+
       requests.push({
         updateTextStyle: {
-          range: { startIndex, endIndex },
+          range,
           textStyle: style,
           fields: fields.join(','),
         },
@@ -623,7 +724,11 @@ function importMarkdownIntoExistingDocumentWithDocsApi_(targetDocumentId, markdo
   }
 }
 
-function importMarkdownIntoExistingDocumentWithDocumentApp_(targetDocumentId, markdownText) {
+function importMarkdownIntoExistingDocumentWithDocumentApp_(targetDocumentId, markdownText, tabContext) {
+  if (tabContext && tabContext.requestTabId) {
+    throw new Error('Table imports with tabId are not supported in DocumentApp fallback. Remove tables or patch the document body.')
+  }
+
   const doc = DocumentApp.openById(targetDocumentId)
   const body = doc.getBody()
   body.clear()
@@ -1021,28 +1126,32 @@ function hexToRgbColor_(hex) {
   }
 }
 
-function clearDocumentViaDocsApi_(documentId) {
-  const doc = docsApiGetDocument_(documentId)
-  const content = (doc && doc.body && doc.body.content) || []
+function clearDocumentViaDocsApi_(documentId, tabContext) {
+  const context = tabContext || resolveDocTabContext_(docsApiGetDocument_(documentId, true))
+  const content = context.content || []
   const last = content.length > 0 ? content[content.length - 1] : null
   const endIndex = last && last.endIndex ? last.endIndex : 1
 
   if (endIndex > 2) {
+    const range = {
+      startIndex: 1,
+      endIndex: endIndex - 1,
+    }
+    if (context.requestTabId) range.tabId = context.requestTabId
+
     docsApiBatchUpdate_(documentId, [
       {
         deleteContentRange: {
-          range: {
-            startIndex: 1,
-            endIndex: endIndex - 1,
-          },
+          range,
         },
       },
     ])
   }
 }
 
-function docsApiGetDocument_(documentId) {
-  return docsApiRequest_('get', 'documents/' + encodeURIComponent(documentId))
+function docsApiGetDocument_(documentId, includeTabsContent) {
+  const query = includeTabsContent ? '?includeTabsContent=true' : ''
+  return docsApiRequest_('get', 'documents/' + encodeURIComponent(documentId) + query)
 }
 
 function docsApiBatchUpdate_(documentId, requests) {

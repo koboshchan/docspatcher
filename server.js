@@ -48,15 +48,16 @@ mcpServer.tool(
 
 mcpServer.tool(
   'getcontents',
-  'Read document content by file `id` in the custom markdown format only. Supports chunked reads with optional 1-based `startLine` and `endLine`. Returns document metadata including `title`, `lastEditedMs`, and `lastEditedIso`. Headings are supported from `#` to `####`. Inline styles may include `**bold**`, `*italic*`, `{u}...{/u}`, `{color:#rrggbb}...{/color}`, and `{size:N}...{/size}` (font size in points). List nesting is exported with leading tabs; unordered list items use `* ` and ordered list items use `N. `.',
+  'Read document content by file `id` in the custom markdown format only. Supports chunked reads with optional 1-based `startLine` and `endLine`, and optional `tabId` (defaults to document body). Returns document metadata including `title`, `lastEditedMs`, `lastEditedIso`, and `availableTabs` (tab id/title/index list). Headings are supported from `#` to `####`. Inline styles may include `**bold**`, `*italic*`, `{u}...{/u}`, `{color:#rrggbb}...{/color}`, and `{size:N}...{/size}` (font size in points). List nesting is exported with leading tabs; unordered list items use `* ` and ordered list items use `N. `.',
   {
     id: z.string().min(1),
     startLine: z.number().int().min(1).optional(),
     endLine: z.number().int().min(1).optional(),
+    tabId: z.string().min(1).optional(),
     format: z.literal('markdown').optional().default('markdown'),
   },
-  async ({ id, startLine, endLine, format }) => {
-    const result = await bridge.call('getcontents', { id, startLine, endLine, format })
+  async ({ id, startLine, endLine, tabId, format }) => {
+    const result = await bridge.call('getcontents', { id, startLine, endLine, tabId, format })
     const structuredContent =
       result && typeof result === 'object' && !Array.isArray(result)
         ? result
@@ -71,15 +72,16 @@ mcpServer.tool(
 
 mcpServer.tool(
   'applypatch',
-  'Apply a patch to a Google Doc using the custom markdown format only. Args: `id`, `patch`, optional `algorithm` (`unified` default or `dmp`). Unified syntax uses hunks like `@@ -oldStart,oldCount +newStart,newCount @@` with context lines prefixed by space, removals with `-`, and additions with `+`. Headings are supported from `#` to `####`. Supported inline style tags are `**bold**`, `*italic*`, `{u}...{/u}`, `{color:#rrggbb}...{/color}`, and `{size:N}...{/size}` (font size in points). For lists, use leading tabs for nesting, `* ` or `- ` for unordered items, and `N. ` for ordered items.',
+  'Apply a patch to a Google Doc using the custom markdown format only. Args: `id`, `patch`, optional `algorithm` (`unified` default or `dmp`), optional `tabId` (defaults to document body). Unified syntax uses hunks like `@@ -oldStart,oldCount +newStart,newCount @@` with context lines prefixed by space, removals with `-`, and additions with `+`. Headings are supported from `#` to `####`. Supported inline style tags are `**bold**`, `*italic*`, `{u}...{/u}`, `{color:#rrggbb}...{/color}`, and `{size:N}...{/size}` (font size in points). For lists, use leading tabs for nesting, `* ` or `- ` for unordered items, and `N. ` for ordered items.',
   {
     id: z.string().min(1),
     patch: z.string().min(1),
     algorithm: z.enum(['unified', 'dmp']).default('unified'),
+    tabId: z.string().min(1).optional(),
     format: z.literal('markdown').optional().default('markdown'),
   },
-  async ({ id, patch, algorithm, format }) => {
-    const result = await bridge.call('applypatch', { id, patch, algorithm, format })
+  async ({ id, patch, algorithm, tabId, format }) => {
+    const result = await bridge.call('applypatch', { id, patch, algorithm, tabId, format })
     return {
       content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
     }
