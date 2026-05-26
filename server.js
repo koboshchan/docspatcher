@@ -47,6 +47,71 @@ mcpServer.tool(
 )
 
 mcpServer.tool(
+  'renamedoc',
+  'Rename a Google Doc file. Args: `id` (doc file id), `title` (new document title).',
+  {
+    id: z.string().min(1),
+    title: z.string().min(1),
+  },
+  async ({ id, title }) => {
+    const result = await bridge.call('renamedoc', { id, title })
+    return {
+      content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+      structuredContent: result,
+    }
+  }
+)
+
+mcpServer.tool(
+  'renametab',
+  'Rename a tab in a Google Doc. Args: `id` (doc id), `tabId` (target tab id), `title` (new tab title).',
+  {
+    id: z.string().min(1),
+    tabId: z.string().min(1),
+    title: z.string().min(1),
+  },
+  async ({ id, tabId, title }) => {
+    const result = await bridge.call('renametab', { id, tabId, title })
+    return {
+      content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+      structuredContent: result,
+    }
+  }
+)
+
+mcpServer.tool(
+  'newdoc',
+  'Create a new Google Doc. Args: `title` (new document title).',
+  {
+    title: z.string().min(1),
+  },
+  async ({ title }) => {
+    const result = await bridge.call('newdoc', { title })
+    return {
+      content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+      structuredContent: result,
+    }
+  }
+)
+
+mcpServer.tool(
+  'newtab',
+  'Create a new tab in a Google Doc. Args: `id` (doc id), `title` (tab title), optional `parentTabId` for nesting.',
+  {
+    id: z.string().min(1),
+    title: z.string().min(1),
+    parentTabId: z.string().min(1).optional(),
+  },
+  async ({ id, title, parentTabId }) => {
+    const result = await bridge.call('newtab', { id, title, parentTabId })
+    return {
+      content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+      structuredContent: result,
+    }
+  }
+)
+
+mcpServer.tool(
   'getcontents',
   'Read document content by file `id` in the custom markdown format only. Supports chunked reads with optional 1-based `startLine` and `endLine`, and optional `tabId` (defaults to document body). Returns document metadata including `title`, `lastEditedMs`, `lastEditedIso`, and `availableTabs` (tab id/title/index list). Headings are supported from `#` to `####`. Inline styles may include `**bold**`, `*italic*`, `{u}...{/u}`, `{color:#rrggbb}...{/color}`, and `{size:N}...{/size}` (font size in points). List nesting is exported with leading tabs; unordered list items use `* ` and ordered list items use `N. `.',
   {

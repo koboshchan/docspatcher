@@ -164,6 +164,62 @@ function buildBridgeHtml_(wsUrl, token) {
             return
           }
 
+          if (msg.method === 'renamedoc') {
+            google.script.run
+              .withSuccessHandler((result) => {
+                logLine('renamedoc success')
+                sendResult(id, result)
+              })
+              .withFailureHandler((err) => {
+                logLine('renamedoc failure')
+                sendError(id, err && err.message)
+              })
+              .mcp_renameDoc(params.id, params.title)
+            return
+          }
+
+          if (msg.method === 'renametab') {
+            google.script.run
+              .withSuccessHandler((result) => {
+                logLine('renametab success')
+                sendResult(id, result)
+              })
+              .withFailureHandler((err) => {
+                logLine('renametab failure')
+                sendError(id, err && err.message)
+              })
+              .mcp_renameTab(params.id, params.tabId, params.title)
+            return
+          }
+
+          if (msg.method === 'newdoc') {
+            google.script.run
+              .withSuccessHandler((result) => {
+                logLine('newdoc success')
+                sendResult(id, result)
+              })
+              .withFailureHandler((err) => {
+                logLine('newdoc failure')
+                sendError(id, err && err.message)
+              })
+              .mcp_newDoc(params.title)
+            return
+          }
+
+          if (msg.method === 'newtab') {
+            google.script.run
+              .withSuccessHandler((result) => {
+                logLine('newtab success')
+                sendResult(id, result)
+              })
+              .withFailureHandler((err) => {
+                logLine('newtab failure')
+                sendError(id, err && err.message)
+              })
+              .mcp_newTab(params.id, params.title, params.parentTabId)
+            return
+          }
+
           if (msg.method === 'getcontents') {
             google.script.run
               .withSuccessHandler((result) => {
@@ -206,6 +262,22 @@ function mcp_getFiles(limit) {
 
 function mcp_searchFiles(query, limit) {
   return searchFiles(query, limit)
+}
+
+function mcp_renameDoc(id, title) {
+  return renameDoc(id, title)
+}
+
+function mcp_renameTab(id, tabId, title) {
+  return renameTab(id, tabId, title)
+}
+
+function mcp_newDoc(title) {
+  return newDoc(title)
+}
+
+function mcp_newTab(id, title, parentTabId) {
+  return newTab(id, title, parentTabId)
 }
 
 function mcp_getContents(id, startLine, endLine, format, tabId) {
@@ -269,6 +341,101 @@ function getDocumentInfo_(id) {
     title: file.getName(),
     lastEditedMs: lastEdited.getTime(),
     lastEditedIso: lastEdited.toISOString(),
+  }
+}
+
+function renameDoc(id, title) {
+  const file = DriveApp.getFileById(id)
+  const nextTitle = String(title || '').trim()
+  if (!nextTitle) throw new Error('title is required')
+
+  file.setName(nextTitle)
+  const updated = file.getLastUpdated()
+  return {
+    id: file.getId(),
+    title: file.getName(),
+    url: file.getUrl(),
+    lastEditedMs: updated.getTime(),
+    lastEditedIso: updated.toISOString(),
+  }
+}
+
+function renameTab(id, tabId, title) {
+  const nextTitle = String(title || '').trim()
+  const resolvedTabId = String(tabId || '').trim()
+  if (!resolvedTabId) throw new Error('tabId is required')
+  if (!nextTitle) throw new Error('title is required')
+
+  docsApiBatchUpdate_(id, [
+    {
+      updateTabProperties: {
+        tabProperties: {
+          tabId: resolvedTabId,
+          title: nextTitle,
+        },
+        fields: 'title',
+      },
+    },
+  ])
+
+  const doc = docsApiGetDocument_(id, true)
+  const tabs = listAvailableTabs_(doc)
+  const tab = tabs.find((t) => t.id === resolvedTabId) || null
+  return {
+    id,
+    tabId: resolvedTabId,
+    title: tab && tab.title ? tab.title : nextTitle,
+    availableTabs: tabs,
+  }
+}
+
+function newDoc(title) {
+  const nextTitle = String(title || '').trim()
+  if (!nextTitle) throw new Error('title is required')
+
+  const doc = DocumentApp.create(nextTitle)
+  const id = doc.getId()
+  const file = DriveApp.getFileById(id)
+  const updated = file.getLastUpdated()
+  return {
+    id,
+    title: file.getName(),
+    url: file.getUrl(),
+    lastEditedMs: updated.getTime(),
+    lastEditedIso: updated.toISOString(),
+  }
+}
+
+function newTab(id, title, parentTabId) {
+  const nextTitle = String(title || '').trim()
+  if (!nextTitle) throw new Error('title is required')
+
+  const createTab = {
+    tabProperties: {
+      title: nextTitle,
+    },
+  }
+
+  const parentId = String(parentTabId || '').trim()
+  if (parentId) {
+    createTab.tabProperties.parentTabId = parentId
+  }
+
+  docsApiBatchUpdate_(id, [
+    {
+      createTab,
+    },
+  ])
+
+  const doc = docsApiGetDocument_(id, true)
+  const tabs = listAvailableTabs_(doc)
+  const created = tabs.filter((t) => t.title === nextTitle)
+  const tab = created.length > 0 ? created[created.length - 1] : null
+  return {
+    id,
+    tabId: tab && tab.id ? tab.id : null,
+    title: tab && tab.title ? tab.title : nextTitle,
+    availableTabs: tabs,
   }
 }
 
