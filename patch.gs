@@ -218,10 +218,7 @@ function mcp_applyPatch(id, patchText, algorithm, format) {
 
 function getContents(id, startLine, endLine, format) {
   const normalizedFormat = normalizeContentFormat_(format)
-  const text =
-    normalizedFormat === 'markdown'
-      ? exportDocumentAsMarkdown_(id)
-      : DocumentApp.openById(id).getBody().editAsText().getText()
+  const text = exportDocumentAsMarkdown_(id)
   const lines = text.split('\n')
   const totalLines = lines.length
 
@@ -251,68 +248,45 @@ function applyPatchToDocument(id, patchText, algorithm, format) {
   const dmp = new diff_match_patch()
   const mode = (algorithm || 'unified').toLowerCase()
   const normalizedFormat = normalizeContentFormat_(format)
-
-  if (normalizedFormat === 'markdown') {
-    const markdown = exportDocumentAsMarkdown_(id)
-    let text2
-    let patchesOrHunks
-    let results
-
-    if (mode === 'unified') {
-      const hunks = parseUnifiedHunks_(patchText)
-      const unifiedResult = applyUnifiedHunksToText_(markdown, hunks)
-      const dmpApplied = applyTextTransitionWithDmpString_(markdown, unifiedResult[0], dmp)
-      text2 = dmpApplied.text
-      results = unifiedResult[1]
-      var dmpResults = dmpApplied.results
-      patchesOrHunks = hunks
-    } else {
-      const dmpResult = applyPatchToText_(markdown, patchText, dmp)
-      text2 = dmpResult[0]
-      patchesOrHunks = dmpResult[1]
-      results = dmpResult[2]
-      var dmpResults = dmpResult[2]
-    }
-
-    importMarkdownIntoExistingDocument_(id, text2)
-    return {
-      algorithm: mode === 'unified' ? 'unified' : 'dmp',
-      format: 'markdown',
-      patches: patchesOrHunks.length,
-      results,
-      dmpResults,
-      textLength: text2.length,
-    }
-  }
-
-  const body = DocumentApp.openById(id).getBody()
-  const doctext = body.editAsText()
+  const markdown = exportDocumentAsMarkdown_(id)
+  let text2
+  let patchesOrHunks
+  let results
+  let dmpResults
 
   if (mode === 'unified') {
-    const [text2, hunks, results, dmpResults] = applyUnifiedPatch(doctext, patchText, dmp)
-    return {
-      algorithm: 'unified',
-      format: 'text',
-      patches: hunks.length,
-      results,
-      dmpResults,
-      textLength: text2.length,
-    }
+    const hunks = parseUnifiedHunks_(patchText)
+    const unifiedResult = applyUnifiedHunksToText_(markdown, hunks)
+    const dmpApplied = applyTextTransitionWithDmpString_(markdown, unifiedResult[0], dmp)
+    text2 = dmpApplied.text
+    results = unifiedResult[1]
+    dmpResults = dmpApplied.results
+    patchesOrHunks = hunks
+  } else {
+    const dmpResult = applyPatchToText_(markdown, patchText, dmp)
+    text2 = dmpResult[0]
+    patchesOrHunks = dmpResult[1]
+    results = dmpResult[2]
+    dmpResults = dmpResult[2]
   }
 
-  const [text2, patches, results] = applyPatch(doctext, patchText, dmp)
+  importMarkdownIntoExistingDocument_(id, text2)
   return {
-    algorithm: 'dmp',
-    format: 'text',
-    patches: patches.length,
+    algorithm: mode === 'unified' ? 'unified' : 'dmp',
+    format: normalizedFormat,
+    patches: patchesOrHunks.length,
     results,
+    dmpResults,
     textLength: text2.length,
   }
 }
 
 function normalizeContentFormat_(format) {
-  const value = String(format || 'text').toLowerCase()
-  return value === 'markdown' ? 'markdown' : 'text'
+  const value = String(format || 'markdown').toLowerCase()
+  if (value && value !== 'markdown') {
+    throw new Error('Only markdown format is supported. Omit `format` or use `markdown`.')
+  }
+  return 'markdown'
 }
 
 function exportDocumentAsMarkdown_(documentId) {
@@ -406,11 +380,24 @@ function markdownLineFromParagraph_(paragraph, listsById, listState) {
 
 function markdownHeadingPrefixFromParagraph_(paragraph) {
   const style = paragraph && paragraph.paragraphStyle
-  const type = style && style.namedStyleType
-  const m = /^HEADING_(\d)$/.exec(String(type || ''))
-  if (!m) return ''
-  const level = Math.max(1, Math.min(6, Number(m[1]) || 1))
+  const level = headingLevelFromNamedStyleType_(style && style.namedStyleType)
+  if (!level) return ''
   return '#'.repeat(level) + ' '
+}
+
+function headingLevelFromNamedStyleType_(namedStyleType) {
+  const type = String(namedStyleType || '')
+  if (type === 'TITLE') return 1
+  if (type === 'SUBTITLE') return 2
+
+  const m = /^HEADING_(\d)$/.exec(type)
+  if (!m) return 0
+  return Math.max(1, Math.min(4, Number(m[1]) || 1))
+}
+
+function namedStyleTypeFromHeadingLevel_(headingLevel) {
+  const level = Math.max(1, Math.min(4, Number(headingLevel) || 1))
+  return 'HEADING_' + level
 }
 
 function markdownListPrefixFromParagraph_(paragraph, listsById, listState) {
@@ -553,7 +540,7 @@ function importMarkdownIntoExistingDocumentWithDocsApi_(targetDocumentId, markdo
         updateParagraphStyle: {
           range: { startIndex: paragraphStart, endIndex: paragraphEnd },
           paragraphStyle: {
-            namedStyleType: 'HEADING_' + line.headingLevel,
+            namedStyleType: namedStyleTypeFromHeadingLevel_(line.headingLevel),
           },
           fields: 'namedStyleType',
         },
@@ -648,7 +635,7 @@ function importMarkdownIntoExistingDocumentWithDocumentApp_(targetDocumentId, ma
     } else {
       element = body.appendParagraph(line.text)
       if (line.headingLevel > 0) {
-        const heading = 'HEADING_' + line.headingLevel
+        const heading = namedStyleTypeFromHeadingLevel_(line.headingLevel)
         if (DocumentApp.ParagraphHeading[heading]) {
           element.setHeading(DocumentApp.ParagraphHeading[heading])
         }
@@ -822,7 +809,7 @@ function shiftStyles_(styles, offset) {
 }
 
 function parseMarkdownLineForDocsApi_(line) {
-  const headingMatch = /^(#{1,6})\s+(.*)$/.exec(line)
+  const headingMatch = /^\s{0,3}(#{1,4})\s+(.*)$/.exec(line)
   if (headingMatch) {
     const inline = parseInlineMarkdownForDocsApi_(headingMatch[2])
     return {

@@ -48,12 +48,12 @@ mcpServer.tool(
 
 mcpServer.tool(
   'getcontents',
-  'Read document content by file `id`. Supports chunked reads with optional 1-based `startLine` and `endLine`, and `format` (`text` or `markdown`). In markdown mode, inline styles may include `**bold**`, `*italic*`, `{u}...{/u}`, `{color:#rrggbb}...{/color}`, and `{size:N}...{/size}` (font size in points). List nesting is exported with leading tabs; unordered list items use `* ` and ordered list items use `N. `.',
+  'Read document content by file `id` in the custom markdown format only. Supports chunked reads with optional 1-based `startLine` and `endLine`. Headings are supported from `#` to `####`. Inline styles may include `**bold**`, `*italic*`, `{u}...{/u}`, `{color:#rrggbb}...{/color}`, and `{size:N}...{/size}` (font size in points). List nesting is exported with leading tabs; unordered list items use `* ` and ordered list items use `N. `.',
   {
     id: z.string().min(1),
     startLine: z.number().int().min(1).optional(),
     endLine: z.number().int().min(1).optional(),
-    format: z.enum(['text', 'markdown']).default('text'),
+    format: z.literal('markdown').optional().default('markdown'),
   },
   async ({ id, startLine, endLine, format }) => {
     const result = await bridge.call('getcontents', { id, startLine, endLine, format })
@@ -71,12 +71,12 @@ mcpServer.tool(
 
 mcpServer.tool(
   'applypatch',
-  'Apply a patch to a Google Doc. Args: `id`, `patch`, optional `algorithm` (`unified` default or `dmp`), optional `format` (`text` or `markdown`). Unified syntax uses hunks like `@@ -oldStart,oldCount +newStart,newCount @@` with context lines prefixed by space, removals with `-`, and additions with `+`. In markdown mode, supported inline style tags are `**bold**`, `*italic*`, `{u}...{/u}`, `{color:#rrggbb}...{/color}`, and `{size:N}...{/size}` (font size in points). For lists, use leading tabs for nesting, `* ` or `- ` for unordered items, and `N. ` for ordered items.',
+  'Apply a patch to a Google Doc using the custom markdown format only. Args: `id`, `patch`, optional `algorithm` (`unified` default or `dmp`). Unified syntax uses hunks like `@@ -oldStart,oldCount +newStart,newCount @@` with context lines prefixed by space, removals with `-`, and additions with `+`. Headings are supported from `#` to `####`. Supported inline style tags are `**bold**`, `*italic*`, `{u}...{/u}`, `{color:#rrggbb}...{/color}`, and `{size:N}...{/size}` (font size in points). For lists, use leading tabs for nesting, `* ` or `- ` for unordered items, and `N. ` for ordered items.',
   {
     id: z.string().min(1),
     patch: z.string().min(1),
     algorithm: z.enum(['unified', 'dmp']).default('unified'),
-    format: z.enum(['text', 'markdown']).default('text'),
+    format: z.literal('markdown').optional().default('markdown'),
   },
   async ({ id, patch, algorithm, format }) => {
     const result = await bridge.call('applypatch', { id, patch, algorithm, format })
