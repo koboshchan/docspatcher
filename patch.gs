@@ -351,41 +351,68 @@ function applyPatchToDocument(id, patchText, algorithm, format, tabId) {
   const dmp = new diff_match_patch()
   const mode = (algorithm || 'unified').toLowerCase()
   const normalizedFormat = normalizeContentFormat_(format)
-  const doc = docsApiGetDocument_(id, true)
-  const tabContext = resolveDocTabContext_(doc, tabId)
-  const markdown = markdownFromDocsApiDocument_(doc, tabContext)
-  let text2
-  let patchesOrHunks
-  let results
-  let dmpResults
-
-  if (mode === 'unified') {
-    const hunks = parseUnifiedHunks_(patchText)
-    const unifiedResult = applyUnifiedHunksToText_(markdown, hunks)
-    const dmpApplied = applyTextTransitionWithDmpString_(markdown, unifiedResult[0], dmp)
-    text2 = dmpApplied.text
-    results = unifiedResult[1]
-    dmpResults = dmpApplied.results
-    patchesOrHunks = hunks
-  } else {
-    const dmpResult = applyPatchToText_(markdown, patchText, dmp)
-    text2 = dmpResult[0]
-    patchesOrHunks = dmpResult[1]
-    results = dmpResult[2]
-    dmpResults = dmpResult[2]
-  }
-
-  importMarkdownIntoExistingDocument_(id, text2, tabContext)
-  return {
+  const debugBase = {
+    documentId: id,
     algorithm: mode === 'unified' ? 'unified' : 'dmp',
     format: normalizedFormat,
-    tabId: tabContext.tabId || null,
-    tabName: tabContext.tabName || null,
-    patches: patchesOrHunks.length,
-    results,
-    dmpResults,
-    textLength: text2.length,
+    tabId: tabId || null,
+    patchText,
   }
+
+  try {
+    const doc = docsApiGetDocument_(id, true)
+    const tabContext = resolveDocTabContext_(doc, tabId)
+    const exported = markdownFromDocsApiDocumentWithLineMap_(doc, tabContext)
+    const markdown = exported.text
+    let text2
+    let patchesOrHunks
+    let results
+    let dmpResults
+
+    if (mode === 'unified') {
+      const hunks = parseUnifiedHunks_(patchText)
+      const unifiedResult = applyUnifiedHunksToText_(markdown, hunks)
+      const dmpApplied = applyTextTransitionWithDmpString_(markdown, unifiedResult[0], dmp)
+      text2 = dmpApplied.text
+      results = unifiedResult[1]
+      dmpResults = dmpApplied.results
+      patchesOrHunks = hunks
+    } else {
+      const dmpResult = applyPatchToText_(markdown, patchText, dmp)
+      text2 = dmpResult[0]
+      patchesOrHunks = dmpResult[1]
+      results = dmpResult[2]
+      dmpResults = dmpResult[2]
+    }
+
+    const appliedIncrementally = applyMarkdownDiffIncremental_(id, exported, text2, tabContext)
+    if (!appliedIncrementally) {
+      importMarkdownIntoExistingDocument_(id, text2, tabContext)
+    }
+
+    return {
+      algorithm: mode === 'unified' ? 'unified' : 'dmp',
+      format: normalizedFormat,
+      tabId: tabContext.tabId || null,
+      tabName: tabContext.tabName || null,
+      appliedIncrementally,
+      patches: patchesOrHunks.length,
+      results,
+      dmpResults,
+      textLength: text2.length,
+    }
+  } catch (err) {
+    throw createApplyPatchDebugError_(err, debugBase)
+  }
+}
+
+function createApplyPatchDebugError_(err, debugData) {
+  const message = String((err && err.message) || err || 'Unknown applypatch error')
+  const payload = {
+    error: message,
+    patchDebug: debugData || {},
+  }
+  return new Error('applypatch failed: ' + JSON.stringify(payload))
 }
 
 function normalizeContentFormat_(format) {
@@ -407,11 +434,17 @@ function importMarkdownIntoExistingDocument_(targetDocumentId, markdownText, tab
 }
 
 function markdownFromDocsApiDocument_(doc, tabContext) {
+  return markdownFromDocsApiDocumentWithLineMap_(doc, tabContext).text
+}
+
+function markdownFromDocsApiDocumentWithLineMap_(doc, tabContext) {
   const context = tabContext || resolveDocTabContext_(doc)
   const content = context.content || []
   const listsById = context.listsById || {}
   const listState = { counters: {} }
   const lines = []
+  const lineMap = []
+  let hasTables = false
 
   for (let i = 0; i < content.length; i++) {
     const block = content[i]
@@ -419,18 +452,241 @@ function markdownFromDocsApiDocument_(doc, tabContext) {
 
     if (block.paragraph) {
       lines.push(markdownLineFromParagraph_(block.paragraph, listsById, listState))
+      lineMap.push({
+        type: 'paragraph',
+        startIndex: Number(block.startIndex) || null,
+        endIndex: Number(block.endIndex) || null,
+      })
       continue
     }
 
     if (block.table) {
+      hasTables = true
       const tableLines = markdownLinesFromTable_(block.table)
-      if (lines.length > 0 && lines[lines.length - 1] !== '') lines.push('')
-      for (let t = 0; t < tableLines.length; t++) lines.push(tableLines[t])
-      if (i < content.length - 1) lines.push('')
+      if (lines.length > 0 && lines[lines.length - 1] !== '') {
+        lines.push('')
+        lineMap.push({ type: 'table-gap', startIndex: null, endIndex: null })
+      }
+      for (let t = 0; t < tableLines.length; t++) {
+        lines.push(tableLines[t])
+        lineMap.push({ type: 'table', startIndex: null, endIndex: null })
+      }
+      if (i < content.length - 1) {
+        lines.push('')
+        lineMap.push({ type: 'table-gap', startIndex: null, endIndex: null })
+      }
     }
   }
 
-  return lines.join('\n')
+  return {
+    text: lines.join('\n'),
+    lines,
+    lineMap,
+    hasTables,
+  }
+}
+
+function applyMarkdownDiffIncremental_(documentId, exported, nextMarkdown, tabContext) {
+  const oldLines = (exported && exported.lines) || []
+  const oldMap = (exported && exported.lineMap) || []
+  const newLines = String(nextMarkdown || '').split('\n')
+  const context = tabContext || { requestTabId: null }
+
+  if (exported && exported.hasTables) return false
+  if (containsMarkdownTableSyntax_(nextMarkdown)) return false
+
+  let prefix = 0
+  while (
+    prefix < oldLines.length &&
+    prefix < newLines.length &&
+    oldLines[prefix] === newLines[prefix]
+  ) {
+    prefix++
+  }
+
+  let suffix = 0
+  while (
+    suffix < oldLines.length - prefix &&
+    suffix < newLines.length - prefix &&
+    oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
+  ) {
+    suffix++
+  }
+
+  const oldStart = prefix
+  const oldEnd = oldLines.length - suffix - 1
+  const newStart = prefix
+  const newEnd = newLines.length - suffix - 1
+
+  if (oldStart > oldEnd && newStart > newEnd) return true
+
+  let insertAt = null
+  let deleteStart = null
+  let deleteEnd = null
+
+  if (oldStart <= oldEnd) {
+    const first = oldMap[oldStart]
+    const last = oldMap[oldEnd]
+    if (!first || !last) return false
+    if (!(first.startIndex > 0) || !(last.endIndex > first.startIndex)) return false
+    insertAt = first.startIndex
+    deleteStart = first.startIndex
+    deleteEnd = last.endIndex
+  } else if (oldMap.length > 0) {
+    if (oldStart < oldMap.length) {
+      const at = oldMap[oldStart]
+      if (!at || !(at.startIndex > 0)) return false
+      insertAt = at.startIndex
+    } else {
+      const tail = oldMap[oldMap.length - 1]
+      if (!tail || !(tail.endIndex > 0)) return false
+      insertAt = tail.endIndex
+    }
+  } else {
+    insertAt = 1
+  }
+
+  if (!(insertAt > 0)) return false
+
+  const replacementLines = newStart <= newEnd ? newLines.slice(newStart, newEnd + 1) : []
+  const replacementMarkdown = replacementLines.join('\n')
+
+  const requests = []
+
+  if (deleteStart !== null && deleteEnd !== null && deleteEnd > deleteStart) {
+    const range = { startIndex: deleteStart, endIndex: deleteEnd }
+    if (context.requestTabId) range.tabId = context.requestTabId
+    requests.push({ deleteContentRange: { range } })
+  }
+
+  if (replacementMarkdown.length > 0) {
+    const location = { index: insertAt }
+    if (context.requestTabId) location.tabId = context.requestTabId
+    requests.push({
+      insertText: {
+        location,
+        text: replacementMarkdown,
+      },
+    })
+
+    const parsed = parseMarkdownDocumentForDocsApi_(replacementMarkdown)
+    for (let i = 0; i < parsed.lines.length; i++) {
+      const line = parsed.lines[i]
+      const paragraphStart = insertAt + line.start
+      const paragraphEnd = paragraphStart + line.text.length + 1
+
+      if (line.headingLevel > 0) {
+        const range = { startIndex: paragraphStart, endIndex: paragraphEnd }
+        if (context.requestTabId) range.tabId = context.requestTabId
+        requests.push({
+          updateParagraphStyle: {
+            range,
+            paragraphStyle: {
+              namedStyleType: namedStyleTypeFromHeadingLevel_(line.headingLevel),
+            },
+            fields: 'namedStyleType',
+          },
+        })
+      }
+
+      if (line.isList && line.text.length > 0) {
+        const range = { startIndex: paragraphStart, endIndex: paragraphEnd }
+        if (context.requestTabId) range.tabId = context.requestTabId
+        requests.push({
+          createParagraphBullets: {
+            range,
+            bulletPreset: line.listType === 'ordered' ? 'NUMBERED_DECIMAL_NESTED' : 'BULLET_DISC_CIRCLE_SQUARE',
+          },
+        })
+      }
+
+      for (let j = 0; j < line.styles.length; j++) {
+        const span = line.styles[j]
+        const startIndex = paragraphStart + span.start
+        const endIndex = startIndex + span.length
+        if (endIndex <= startIndex) continue
+
+        const style = {}
+        const fields = []
+        if (span.bold) {
+          style.bold = true
+          fields.push('bold')
+        }
+        if (span.italic) {
+          style.italic = true
+          fields.push('italic')
+        }
+        if (span.underline) {
+          style.underline = true
+          fields.push('underline')
+        }
+        if (span.foregroundColor) {
+          const rgb = hexToRgbColor_(span.foregroundColor)
+          if (rgb) {
+            style.foregroundColor = { color: { rgbColor: rgb } }
+            fields.push('foregroundColor')
+          }
+        }
+        if (span.fontSize) {
+          style.fontSize = { magnitude: Number(span.fontSize), unit: 'PT' }
+          fields.push('fontSize')
+        }
+        if (fields.length === 0) continue
+
+        const range = { startIndex, endIndex }
+        if (context.requestTabId) range.tabId = context.requestTabId
+        requests.push({
+          updateTextStyle: {
+            range,
+            textStyle: style,
+            fields: fields.join(','),
+          },
+        })
+      }
+    }
+  }
+
+  if (requests.length === 0) return true
+
+  try {
+    docsApiBatchUpdate_(documentId, requests)
+  } catch (err) {
+    throw createApplyPatchDebugError_(err, {
+      phase: 'incremental-batch-update',
+      documentId,
+      tabId: context.requestTabId || null,
+      oldStart,
+      oldEnd,
+      newStart,
+      newEnd,
+      insertAt,
+      deleteStart,
+      deleteEnd,
+      replacementMarkdown,
+      requestCount: requests.length,
+      failedRequest: extractFailedRequestContext_((err && err.message) || '', requests),
+    })
+  }
+
+  return true
+}
+
+function extractFailedRequestContext_(message, requests) {
+  const m = /requests\[(\d+)\]/.exec(String(message || ''))
+  if (!m) {
+    return {
+      index: null,
+      context: requests.slice(0, Math.min(5, requests.length)),
+    }
+  }
+
+  const index = Number(m[1])
+  const start = Math.max(0, index - 2)
+  const end = Math.min(requests.length, index + 3)
+  return {
+    index,
+    context: requests.slice(start, end),
+  }
 }
 
 function markdownLinesFromTable_(table) {
