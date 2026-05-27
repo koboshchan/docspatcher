@@ -717,6 +717,7 @@ function applyMarkdownDiffIncremental_(documentId, exported, nextMarkdown, tabCo
 
   const replacementLines = newStart <= newEnd ? newLines.slice(newStart, newEnd + 1) : []
   const replacementMarkdown = replacementLines.join('\n')
+  const parsed = parseMarkdownDocumentForDocsApi_(replacementMarkdown)
 
   const requests = []
 
@@ -726,17 +727,16 @@ function applyMarkdownDiffIncremental_(documentId, exported, nextMarkdown, tabCo
     requests.push({ deleteContentRange: { range } })
   }
 
-  if (replacementMarkdown.length > 0) {
+  if (parsed.text.length > 0) {
     const location = { index: insertAt }
     if (context.requestTabId) location.tabId = context.requestTabId
     requests.push({
       insertText: {
         location,
-        text: replacementMarkdown,
+        text: parsed.text,
       },
     })
 
-    const parsed = parseMarkdownDocumentForDocsApi_(replacementMarkdown)
     for (let i = 0; i < parsed.lines.length; i++) {
       const line = parsed.lines[i]
       const paragraphStart = insertAt + line.start
@@ -1148,15 +1148,19 @@ function importMarkdownIntoExistingDocumentWithDocsApi_(targetDocumentId, markdo
 }
 
 function importMarkdownIntoExistingDocumentWithDocumentApp_(targetDocumentId, markdownText, tabContext) {
-  if (tabContext && tabContext.requestTabId) {
-    throw new Error('Table imports with tabId are not supported in DocumentApp fallback. Remove tables or patch the document body.')
-  }
-
   const doc = DocumentApp.openById(targetDocumentId)
-  const body = doc.getBody()
+  let body
+  if (tabContext && tabContext.requestTabId) {
+    const tab = findDocumentAppTab_(doc.getTabs(), tabContext.requestTabId)
+    if (!tab) throw new Error('Tab not found in DocumentApp: ' + tabContext.requestTabId)
+    body = tab.asDocumentTab().getBody()
+  } else {
+    body = doc.getBody()
+  }
   body.clear()
 
   const blocks = parseMarkdownBlocksForDocumentApp_(String(markdownText || ''))
+  const listMeta = [] // {listType, hasText} for each list item in insertion order
 
   for (let i = 0; i < blocks.length; i++) {
     const block = blocks[i]
@@ -1173,24 +1177,92 @@ function importMarkdownIntoExistingDocumentWithDocumentApp_(targetDocumentId, ma
     }
 
     const line = parseMarkdownLineForDocsApi_(block.text)
-    let element
     if (line.isList) {
-      element = body.appendListItem(line.text)
-      if (line.nestingLevel > 0) {
-        element.setNestingLevel(line.nestingLevel)
-      }
+      // Prepend nesting tabs so createParagraphBullets (applied below via Docs API)
+      // can infer the nesting level and remove them cleanly.
+      const nestingTabs = '\t'.repeat(line.nestingLevel || 0)
+      const element = body.appendListItem(nestingTabs + line.text)
+      applyInlineStylesToTextElement_(element.editAsText(), shiftStyles_(line.styles, line.nestingLevel || 0))
+      listMeta.push({ listType: line.listType, hasText: line.text.length > 0 })
     } else {
-      element = body.appendParagraph(line.text)
+      const element = body.appendParagraph(line.text)
       if (line.headingLevel > 0) {
-        const heading = namedStyleTypeFromHeadingLevel_(line.headingLevel)
-        if (DocumentApp.ParagraphHeading[heading]) {
-          element.setHeading(DocumentApp.ParagraphHeading[heading])
+        const headingKey = 'HEADING' + line.headingLevel
+        if (DocumentApp.ParagraphHeading[headingKey]) {
+          element.setHeading(DocumentApp.ParagraphHeading[headingKey])
         }
       }
+      applyInlineStylesToTextElement_(element.editAsText(), line.styles)
     }
-
-    applyInlineStylesToTextElement_(element.editAsText(), line.styles)
   }
+
+  // Apply correct bullet presets and nesting via Docs API.
+  // DocumentApp's setGlyphType is unreliable for nested ordered items; the Docs API
+  // createParagraphBullets preset is the authoritative way to configure list glyphs.
+  if (listMeta.length > 0) {
+    fixDocumentAppListPresets_(targetDocumentId, listMeta, tabContext)
+  }
+}
+
+function findDocumentAppTab_(tabs, targetId) {
+  for (let i = 0; i < tabs.length; i++) {
+    if (tabs[i].getId() === targetId) return tabs[i]
+    const nested = findDocumentAppTab_(tabs[i].getChildTabs(), targetId)
+    if (nested) return nested
+  }
+  return null
+}
+
+function fixDocumentAppListPresets_(documentId, listMeta, tabContext) {
+  // Re-read the document via Docs API to get paragraph indices, then apply the
+  // correct createParagraphBullets preset for each list item.  DocumentApp's
+  // setGlyphType cannot reliably configure nested ordered list levels.
+  const tabId = tabContext && tabContext.requestTabId ? tabContext.requestTabId : null
+  const doc = docsApiGetDocument_(documentId, true)
+  const resolvedContext = resolveDocTabContext_(doc, tabId)
+  const content = resolvedContext.content || []
+
+  // Collect all bullet paragraphs in document order (these are our list items).
+  const bulletParas = []
+  for (let i = 0; i < content.length; i++) {
+    const el = content[i]
+    if (el && el.paragraph && el.paragraph.bullet) {
+      bulletParas.push(el)
+    }
+  }
+
+  // Match listMeta[i] to bulletParas[i] positionally (same insertion order).
+  const requests = []
+  for (let i = 0; i < listMeta.length && i < bulletParas.length; i++) {
+    const meta = listMeta[i]
+    const para = bulletParas[i]
+    if (!meta.hasText) continue
+
+    const start = para.startIndex
+    const end = para.endIndex
+    if (!(end > start)) continue
+
+    const range = { startIndex: start, endIndex: end }
+    if (tabId) range.tabId = tabId
+
+    requests.push({
+      createParagraphBullets: {
+        range,
+        bulletPreset: meta.listType === 'ordered' ? 'NUMBERED_DECIMAL_NESTED' : 'BULLET_DISC_CIRCLE_SQUARE',
+      },
+    })
+  }
+
+  if (requests.length === 0) return
+
+  // Apply in reverse document order: createParagraphBullets removes leading tab
+  // characters from each paragraph, shifting the indices of all subsequent paragraphs.
+  // Processing last-to-first ensures previously computed indices remain valid.
+  requests.sort(function(a, b) {
+    return (b.createParagraphBullets.range.startIndex || 0) - (a.createParagraphBullets.range.startIndex || 0)
+  })
+
+  docsApiBatchUpdate_(documentId, requests)
 }
 
 function parseMarkdownBlocksForDocumentApp_(markdownText) {
@@ -1356,13 +1428,13 @@ function shiftStyles_(styles, offset) {
 }
 
 function parseMarkdownLineForDocsApi_(line) {
-  const headingMatch = /^\s{0,3}(#{1,4})\s+(.*)$/.exec(line)
-  if (headingMatch) {
-    const inline = parseInlineMarkdownForDocsApi_(headingMatch[2])
+  const headingInfo = parseHeadingFromLine_(line)
+  if (headingInfo) {
+    const inline = parseInlineMarkdownForDocsApi_(headingInfo.content)
     return {
       text: inline.text,
       styles: inline.styles,
-      headingLevel: headingMatch[1].length,
+      headingLevel: headingInfo.level,
       isList: false,
       listType: null,
     }
@@ -1372,7 +1444,7 @@ function parseMarkdownLineForDocsApi_(line) {
   if (unorderedMatch) {
     const detailed = /^([ \t]*)[-*+]\s+(.*)$/.exec(line)
     const leading = detailed ? detailed[1] : ''
-    const content = detailed ? detailed[2] : unorderedMatch[1]
+    const content = normalizeListMarkdownContent_(detailed ? detailed[2] : unorderedMatch[1])
     const inline = parseInlineMarkdownForDocsApi_(content)
     return {
       text: inline.text,
@@ -1388,7 +1460,7 @@ function parseMarkdownLineForDocsApi_(line) {
   if (orderedMatch) {
     const detailed = /^([ \t]*)\d+\.\s+(.*)$/.exec(line)
     const leading = detailed ? detailed[1] : ''
-    const content = detailed ? detailed[2] : orderedMatch[1]
+    const content = normalizeListMarkdownContent_(detailed ? detailed[2] : orderedMatch[1])
     const inline = parseInlineMarkdownForDocsApi_(content)
     return {
       text: inline.text,
@@ -1409,6 +1481,42 @@ function parseMarkdownLineForDocsApi_(line) {
     listType: null,
     nestingLevel: 0,
   }
+}
+
+function parseHeadingFromLine_(line) {
+  const text = String(line || '')
+
+  const plain = /^\s{0,3}(#{1,4})\s+(.*)$/.exec(text)
+  if (plain) {
+    return {
+      level: plain[1].length,
+      content: plain[2],
+    }
+  }
+
+  const escaped = /^\s{0,3}((?:\\#){1,4})\s+(.*)$/.exec(text)
+  if (escaped) {
+    const level = (escaped[1].match(/\\#/g) || []).length
+    return {
+      level: Math.max(1, Math.min(4, level)),
+      content: escaped[2],
+    }
+  }
+
+  return null
+}
+
+function normalizeListMarkdownContent_(content) {
+  let text = String(content || '')
+  let prev
+  do {
+    prev = text
+    text = text.replace(/^\s*\\[*+-]\s+/, '')
+    text = text.replace(/^\s*\\\d+\.\s+/, '')
+    text = text.replace(/^\s*(?:\\#){1,4}\s+/, '')
+    text = text.replace(/^\s*#{1,4}\s+/, '')
+  } while (text !== prev)
+  return text
 }
 
 function listNestingLevelFromLeading_(leading) {
@@ -1508,7 +1616,23 @@ function parseInlineMarkdownForDocsApi_(content) {
     const ch = content.charAt(i)
     const next = content.charAt(i + 1)
 
-    if (ch === '\\' && (next === '*' || next === '\\' || next === '{' || next === '}')) {
+    if (
+      ch === '\\' &&
+      (next === '*' ||
+        next === '\\' ||
+        next === '{' ||
+        next === '}' ||
+        next === '#' ||
+        next === '+' ||
+        next === '-' ||
+        next === '.' ||
+        next === '[' ||
+        next === ']' ||
+        next === '(' ||
+        next === ')' ||
+        next === '_' ||
+        next === '`')
+    ) {
       plain += next
       i += 2
       continue
