@@ -73,6 +73,34 @@ Literal backslash: \\
 | {u}Underline{/u} | {color:#cc0000}Color{/color} | {size:16}Size{/size} |
 | Escaped \| pipe | Text with \\ backslash | Final cell |
 
+## Table Cell Backgrounds
+
+| {cellbg:#ffd700}Gold | {cellbg:#00c8ff}Blue | {cellbg:#00e676}Green |
+| :---- | :---- | :---- |
+| {cellbg:#ff6b6b}Warning | Normal | {cellbg:#aa00ff}Purple |
+| Multi-line<br>cell content | {cellbg:#ffe082}Yellow | Plain |
+
+## Text Highlight
+
+Plain text with {highlight:#ffff00}yellow highlight{/highlight} inline.
+
+{highlight:#ff9999}A fully highlighted sentence.{/highlight}
+
+Mixed: **Bold** and {highlight:#ccff90}**{highlight:#ccff90}bold highlighted{/highlight}** text.
+
+Nested styles: {color:#0055aa}{highlight:#ffe0b2}Color and highlight together{/highlight}{/color}
+
+## Merged Table Cells (Colspan)
+
+| Header spans two cols | | Third col |
+| :---- | :---- | :---- |
+| {cellbg:#e3f2fd}Merged cell | | Side cell |
+| A | B | C |
+
+| Full-width header | | |
+| :---- | :---- | :---- |
+| One | Two | Three |
+
 ## Combined Block
 
 #### Combined Formatting Demo
@@ -81,5 +109,18 @@ Literal backslash: \\
 	1. {size:13}Nested ordered size{/size}
 	2. {u}Nested ordered underline{/u}
 		* ***Deep mixed bold+italic***
+
+## Highlight in Lists
+
+* {highlight:#fff9c4}Highlighted list item{/highlight}
+* Normal item with {highlight:#b2dfdb}mid-sentence highlight{/highlight} here
+	1. {highlight:#ffccbc}Nested highlighted ordered item{/highlight}
+
+## Table with Highlights and Backgrounds
+
+| {cellbg:#263238}{color:#ffffff}Dark header{/color} | {cellbg:#263238}{color:#ffffff}Dark header 2{/color} |
+| :---- | :---- |
+| {highlight:#ffff8d}Highlighted cell text | Normal cell |
+| {cellbg:#e8f5e9}Green bg | {cellbg:#fce4ec}Pink bg |
 
 End of test file.
