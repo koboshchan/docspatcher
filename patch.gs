@@ -410,25 +410,14 @@ function newTab(id, title, parentTabId) {
   const nextTitle = String(title || '').trim()
   if (!nextTitle) throw new Error('title is required')
 
-  const createTab = {
-    tabProperties: {
-      title: nextTitle,
-    },
-  }
-
+  const tabProps = { title: nextTitle }
   const parentId = String(parentTabId || '').trim()
-  if (parentId) {
-    createTab.tabProperties.parentTabId = parentId
-  }
+  if (parentId) tabProps.parentTabId = parentId
 
-  docsApiBatchUpdate_(id, [
-    {
-      createTab,
-    },
-  ])
+  docsApiBatchUpdate_(id, [{ addDocumentTab: { tabProperties: tabProps } }])
 
-  const doc = docsApiGetDocument_(id, true)
-  const tabs = listAvailableTabs_(doc)
+  const freshDoc = docsApiGetDocument_(id, true)
+  const tabs = listAvailableTabs_(freshDoc)
   const created = tabs.filter((t) => t.title === nextTitle)
   const tab = created.length > 0 ? created[created.length - 1] : null
   return {
@@ -794,6 +783,13 @@ function applyMarkdownDiffIncremental_(documentId, exported, nextMarkdown, tabCo
             fields.push('foregroundColor')
           }
         }
+        if (span.backgroundColor) {
+          const bgRgb = hexToRgbColor_(span.backgroundColor)
+          if (bgRgb) {
+            style.backgroundColor = { color: { rgbColor: bgRgb } }
+            fields.push('backgroundColor')
+          }
+        }
         if (span.fontSize) {
           style.fontSize = { magnitude: Number(span.fontSize), unit: 'PT' }
           fields.push('fontSize')
@@ -868,6 +864,8 @@ function markdownLinesFromTable_(table) {
     const parsedRow = []
     for (let c = 0; c < cells.length; c++) {
       parsedRow.push(markdownTextFromTableCell_(cells[c]))
+      const colSpan = (cells[c].tableCellStyle && cells[c].tableCellStyle.columnSpan) || 1
+      for (let s = 1; s < colSpan; s++) parsedRow.push('')
     }
     if (parsedRow.length > maxCols) maxCols = parsedRow.length
     parsedRows.push(parsedRow)
@@ -900,7 +898,10 @@ function markdownTextFromTableCell_(cell) {
     segments.push(markdownTextFromParagraphElements_(block.paragraph.elements || []))
   }
 
-  return segments.join('<br>').replace(/\|/g, '\\|')
+  let text = segments.join('<br>').replace(/\|/g, '\\|')
+  const bg = getTableCellBackgroundColor_(cell)
+  if (bg) text = '{cellbg:' + bg + '}' + text
+  return text
 }
 
 function markdownLineFromParagraph_(paragraph, listsById, listState) {
@@ -992,6 +993,7 @@ function applyMarkdownInlineStyle_(text, style) {
   const hasUnderline = !!(style && style.underline)
   const color = getHexColorFromTextStyle_(style)
   const size = getFontSizeFromTextStyle_(style)
+  const highlight = getHighlightColorFromTextStyle_(style)
 
   let out = text
   if (hasBold && hasItalic) out = '***' + out + '***'
@@ -1001,6 +1003,7 @@ function applyMarkdownInlineStyle_(text, style) {
 
   if (size) out = '{size:' + size + '}' + out + '{/size}'
   if (color) out = '{color:' + color + '}' + out + '{/color}'
+  if (highlight) out = '{highlight:' + highlight + '}' + out + '{/highlight}'
   return out
 }
 
@@ -1038,6 +1041,51 @@ function getFontSizeFromTextStyle_(style) {
   const magnitude = Number(fs.magnitude)
   if (!(magnitude > 0)) return null
   return Math.round(magnitude)
+}
+
+function getHighlightColorFromTextStyle_(style) {
+  const bg = style && style.backgroundColor
+  const rgb =
+    (bg && bg.color && bg.color.rgbColor) ||
+    (bg && bg.opaqueColor && bg.opaqueColor.rgbColor) ||
+    (bg && bg.rgbColor)
+  if (!rgb) return null
+
+  function toHexChannel_(n) {
+    const v = Math.max(0, Math.min(255, Math.round((Number(n) || 0) * 255)))
+    const h = v.toString(16)
+    return h.length === 1 ? '0' + h : h
+  }
+
+  const hex =
+    '#' +
+    toHexChannel_(rgb.red) +
+    toHexChannel_(rgb.green) +
+    toHexChannel_(rgb.blue)
+  return hex === '#ffffff' ? null : hex
+}
+
+function getTableCellBackgroundColor_(cell) {
+  const style = cell && cell.tableCellStyle
+  const bg = style && style.backgroundColor
+  const rgb =
+    (bg && bg.color && bg.color.rgbColor) ||
+    (bg && bg.opaqueColor && bg.opaqueColor.rgbColor) ||
+    (bg && bg.rgbColor)
+  if (!rgb) return null
+
+  function toHexChannel_(n) {
+    const v = Math.max(0, Math.min(255, Math.round((Number(n) || 0) * 255)))
+    const h = v.toString(16)
+    return h.length === 1 ? '0' + h : h
+  }
+
+  const hex =
+    '#' +
+    toHexChannel_(rgb.red) +
+    toHexChannel_(rgb.green) +
+    toHexChannel_(rgb.blue)
+  return hex === '#ffffff' ? null : hex
 }
 
 function importMarkdownIntoExistingDocumentWithDocsApi_(targetDocumentId, markdownText, tabContext) {
@@ -1123,6 +1171,13 @@ function importMarkdownIntoExistingDocumentWithDocsApi_(targetDocumentId, markdo
           fields.push('foregroundColor')
         }
       }
+      if (span.backgroundColor) {
+        const bgRgb = hexToRgbColor_(span.backgroundColor)
+        if (bgRgb) {
+          style.backgroundColor = { color: { rgbColor: bgRgb } }
+          fields.push('backgroundColor')
+        }
+      }
       if (span.fontSize) {
         style.fontSize = { magnitude: Number(span.fontSize), unit: 'PT' }
         fields.push('fontSize')
@@ -1160,7 +1215,12 @@ function importMarkdownIntoExistingDocumentWithDocumentApp_(targetDocumentId, ma
   body.clear()
 
   const blocks = parseMarkdownBlocksForDocumentApp_(String(markdownText || ''))
-  const listMeta = [] // {listType, hasText} for each list item in insertion order
+  // listMeta tracks each list item's type and the exact text appended (tabs + content).
+  // Text-based matching in fixDocumentAppListPresets_ is robust against content offset
+  // uncertainties that come from body.clear() trailing paragraphs and table elements.
+  const listMeta = []
+  // tableMeta tracks tables with merged cells that need post-processing via Docs API.
+  const tableMeta = []
 
   for (let i = 0; i < blocks.length; i++) {
     const block = blocks[i]
@@ -1170,20 +1230,27 @@ function importMarkdownIntoExistingDocumentWithDocumentApp_(targetDocumentId, ma
       for (let r = 0; r < block.rows.length; r++) {
         for (let c = 0; c < block.rows[r].length; c++) {
           const cellSpec = block.rows[r][c]
-          applyInlineStylesToTextElement_(table.getCell(r, c).editAsText(), cellSpec.styles)
+          const tableCell = table.getCell(r, c)
+          applyInlineStylesToTextElement_(tableCell.editAsText(), cellSpec.styles)
+          if (cellSpec.backgroundColor) tableCell.setBackgroundColor(cellSpec.backgroundColor)
         }
+      }
+      if (block.merges && block.merges.length > 0) {
+        tableMeta.push({ tableOrder: tableMeta.length, merges: block.merges })
       }
       continue
     }
 
     const line = parseMarkdownLineForDocsApi_(block.text)
     if (line.isList) {
-      // Prepend nesting tabs so createParagraphBullets (applied below via Docs API)
-      // can infer the nesting level and remove them cleanly.
+      // Use appendParagraph (NOT appendListItem) so the paragraph has no bullet yet.
+      // createParagraphBullets only infers nesting from leading tabs and applies the
+      // correct preset on plain paragraphs; it cannot re-nest existing list items.
       const nestingTabs = '\t'.repeat(line.nestingLevel || 0)
-      const element = body.appendListItem(nestingTabs + line.text)
+      const fullText = nestingTabs + line.text
+      const element = body.appendParagraph(fullText)
       applyInlineStylesToTextElement_(element.editAsText(), shiftStyles_(line.styles, line.nestingLevel || 0))
-      listMeta.push({ listType: line.listType, hasText: line.text.length > 0 })
+      listMeta.push({ listType: line.listType, hasText: line.text.length > 0, fullText })
     } else {
       const element = body.appendParagraph(line.text)
       if (line.headingLevel > 0) {
@@ -1194,6 +1261,18 @@ function importMarkdownIntoExistingDocumentWithDocumentApp_(targetDocumentId, ma
       }
       applyInlineStylesToTextElement_(element.editAsText(), line.styles)
     }
+  }
+
+  // IMPORTANT: saveAndClose() before switching to the Docs REST API.
+  // Apps Script warns that mixing DocumentApp and Docs API on the same document
+  // causes race conditions — DocumentApp holds a write session that conflicts with
+  // REST API changes.  saveAndClose() commits all pending DocumentApp writes so the
+  // subsequent Docs API reads and createParagraphBullets requests see correct indices.
+  doc.saveAndClose()
+
+  // Apply merged cells via Docs API before list presets (merges alter table structure).
+  if (tableMeta.length > 0) {
+    fixDocumentAppTableMerges_(targetDocumentId, tableMeta, tabContext)
   }
 
   // Apply correct bullet presets and nesting via Docs API.
@@ -1213,56 +1292,144 @@ function findDocumentAppTab_(tabs, targetId) {
   return null
 }
 
-function fixDocumentAppListPresets_(documentId, listMeta, tabContext) {
-  // Re-read the document via Docs API to get paragraph indices, then apply the
-  // correct createParagraphBullets preset for each list item.  DocumentApp's
-  // setGlyphType cannot reliably configure nested ordered list levels.
+function fixDocumentAppTableMerges_(documentId, tableMeta, tabContext) {
   const tabId = tabContext && tabContext.requestTabId ? tabContext.requestTabId : null
   const doc = docsApiGetDocument_(documentId, true)
   const resolvedContext = resolveDocTabContext_(doc, tabId)
   const content = resolvedContext.content || []
 
-  // Collect all bullet paragraphs in document order (these are our list items).
-  const bulletParas = []
+  // Collect table start indices in document order.
+  const tableStartIndices = []
   for (let i = 0; i < content.length; i++) {
-    const el = content[i]
-    if (el && el.paragraph && el.paragraph.bullet) {
-      bulletParas.push(el)
+    if (content[i] && content[i].table) {
+      tableStartIndices.push(content[i].startIndex)
     }
   }
 
-  // Match listMeta[i] to bulletParas[i] positionally (same insertion order).
   const requests = []
-  for (let i = 0; i < listMeta.length && i < bulletParas.length; i++) {
+  for (let t = 0; t < tableMeta.length; t++) {
+    const meta = tableMeta[t]
+    const tableIdx = tableStartIndices[meta.tableOrder]
+    if (tableIdx == null) continue
+    for (let m = 0; m < meta.merges.length; m++) {
+      const merge = meta.merges[m]
+      const tableCellLocation = {
+        tableStartLocation: { index: tableIdx },
+        rowIndex: merge.rowIndex,
+        columnIndex: merge.colIndex,
+      }
+      if (tabId) tableCellLocation.tableStartLocation.tabId = tabId
+      requests.push({
+        mergeTableCells: {
+          tableRange: {
+            tableCellLocation,
+            rowSpan: merge.rowSpan,
+            columnSpan: merge.colSpan,
+          },
+        },
+      })
+    }
+  }
+
+  if (requests.length > 0) {
+    docsApiBatchUpdate_(documentId, requests)
+  }
+}
+
+function fixDocumentAppListPresets_(documentId, listMeta, tabContext) {
+  // Re-read via Docs API and match each list item to its paragraph by text content.
+  // Text matching avoids fragile index arithmetic (body.clear() trailing paragraphs,
+  // table elements, etc. make absolute content[] offsets unreliable).
+  const tabId = tabContext && tabContext.requestTabId ? tabContext.requestTabId : null
+  const doc = docsApiGetDocument_(documentId, true)
+  const resolvedContext = resolveDocTabContext_(doc, tabId)
+  const content = resolvedContext.content || []
+
+  // Collect plain (non-bullet) paragraphs with their text and doc indices.
+  const plainParas = []
+  for (let i = 0; i < content.length; i++) {
+    const el = content[i]
+    if (el && el.paragraph && !el.paragraph.bullet) {
+      const text = getDocsParagraphText_(el.paragraph)
+      plainParas.push({ text, start: el.startIndex, end: el.endIndex, used: false })
+    }
+  }
+
+  // Match each list item to the next unused paragraph whose text equals fullText.
+  // Build a flat matched[] array (null for unmatched/empty items) in insertion order.
+  const matched = []
+  for (let i = 0; i < listMeta.length; i++) {
     const meta = listMeta[i]
-    const para = bulletParas[i]
-    if (!meta.hasText) continue
+    if (!meta.hasText) { matched.push(null); continue }
 
-    const start = para.startIndex
-    const end = para.endIndex
+    let found = null
+    for (let j = 0; j < plainParas.length; j++) {
+      if (!plainParas[j].used && plainParas[j].text === meta.fullText) {
+        found = plainParas[j]
+        plainParas[j].used = true
+        break
+      }
+    }
+    matched.push(found ? { listType: meta.listType, start: found.start, end: found.end } : null)
+  }
+
+  // Group consecutive matched items of the same listType that are adjacent in the
+  // document (endIndex of one paragraph === startIndex of the next). A single
+  // createParagraphBullets call covering the whole group lets the Docs API infer
+  // nesting level from leading tab characters — calling it per-paragraph would give
+  // each item its own list with no nesting context.
+  const groups = []
+  let i = 0
+  while (i < matched.length) {
+    if (!matched[i]) { i++; continue }
+    const group = [matched[i]]
+    while (
+      i + 1 < matched.length &&
+      matched[i + 1] &&
+      matched[i + 1].listType === group[0].listType &&
+      matched[i + 1].start === group[group.length - 1].end
+    ) {
+      i++
+      group.push(matched[i])
+    }
+    groups.push(group)
+    i++
+  }
+
+  // One createParagraphBullets request per group spanning its full range.
+  const requests = []
+  for (let g = 0; g < groups.length; g++) {
+    const group = groups[g]
+    const start = group[0].start
+    const end = group[group.length - 1].end
     if (!(end > start)) continue
-
     const range = { startIndex: start, endIndex: end }
     if (tabId) range.tabId = tabId
-
     requests.push({
       createParagraphBullets: {
         range,
-        bulletPreset: meta.listType === 'ordered' ? 'NUMBERED_DECIMAL_NESTED' : 'BULLET_DISC_CIRCLE_SQUARE',
+        bulletPreset: group[0].listType === 'ordered' ? 'NUMBERED_DECIMAL_NESTED' : 'BULLET_DISC_CIRCLE_SQUARE',
       },
     })
   }
 
   if (requests.length === 0) return
 
-  // Apply in reverse document order: createParagraphBullets removes leading tab
-  // characters from each paragraph, shifting the indices of all subsequent paragraphs.
-  // Processing last-to-first ensures previously computed indices remain valid.
+  // Apply in reverse document order so index shifts from tab removal don't
+  // invalidate the start/end indices of earlier (lower-index) groups.
   requests.sort(function(a, b) {
     return (b.createParagraphBullets.range.startIndex || 0) - (a.createParagraphBullets.range.startIndex || 0)
   })
 
   docsApiBatchUpdate_(documentId, requests)
+}
+
+function getDocsParagraphText_(paragraph) {
+  const elements = (paragraph && paragraph.elements) || []
+  return elements
+    .map(function(e) { return (e.textRun && e.textRun.content) || '' })
+    .join('')
+    .replace(/\n$/, '')
 }
 
 function parseMarkdownBlocksForDocumentApp_(markdownText) {
@@ -1284,7 +1451,8 @@ function parseMarkdownBlocksForDocumentApp_(markdownText) {
 
       const rows = parseMarkdownTableRows_(tableLines)
       if (rows.length > 0) {
-        blocks.push({ type: 'table', rows })
+        const merges = computeTableMerges_(rows)
+        blocks.push({ type: 'table', rows, merges })
       }
       continue
     }
@@ -1294,6 +1462,33 @@ function parseMarkdownBlocksForDocumentApp_(markdownText) {
   }
 
   return blocks
+}
+
+function computeTableMerges_(rows) {
+  const merges = []
+  for (let r = 0; r < rows.length; r++) {
+    let c = 0
+    while (c < rows[r].length) {
+      const cell = rows[r][c]
+      if (cell.text || cell.backgroundColor) {
+        let span = 1
+        while (
+          c + span < rows[r].length &&
+          !rows[r][c + span].text &&
+          !rows[r][c + span].backgroundColor
+        ) {
+          span++
+        }
+        if (span > 1) {
+          merges.push({ rowIndex: r, colIndex: c, rowSpan: 1, colSpan: span })
+        }
+        c += span
+      } else {
+        c++
+      }
+    }
+  }
+  return merges
 }
 
 function isMarkdownTableRowLine_(line) {
@@ -1312,8 +1507,12 @@ function parseMarkdownTableRows_(tableLines) {
     const cellsRaw = splitMarkdownTableRowCells_(tableLines[i])
     const cells = []
     for (let c = 0; c < cellsRaw.length; c++) {
-      const inline = parseInlineMarkdownForDocsApi_(cellsRaw[c].replace(/<br\s*\/?\s*>/gi, '\n'))
-      cells.push({ text: inline.text, styles: inline.styles })
+      const rawCell = cellsRaw[c].replace(/<br\s*\/?\s*>/gi, '\n')
+      const bgMatch = /^\{cellbg:(#[0-9a-fA-F]{6})\}/.exec(rawCell)
+      const backgroundColor = bgMatch ? bgMatch[1].toLowerCase() : null
+      const cellContent = bgMatch ? rawCell.substring(bgMatch[0].length) : rawCell
+      const inline = parseInlineMarkdownForDocsApi_(cellContent)
+      cells.push({ text: inline.text, styles: inline.styles, backgroundColor })
     }
     if (cells.length > maxCols) maxCols = cells.length
     rows.push(cells)
@@ -1321,7 +1520,7 @@ function parseMarkdownTableRows_(tableLines) {
 
   for (let r = 0; r < rows.length; r++) {
     while (rows[r].length < maxCols) {
-      rows[r].push({ text: '', styles: [] })
+      rows[r].push({ text: '', styles: [], backgroundColor: null })
     }
   }
 
@@ -1369,6 +1568,7 @@ function applyInlineStylesToTextElement_(textElement, styles) {
     if (span.underline) textElement.setUnderline(start, end, true)
     if (span.foregroundColor) textElement.setForegroundColor(start, end, span.foregroundColor)
     if (span.fontSize) textElement.setFontSize(start, end, Number(span.fontSize))
+    if (span.backgroundColor) textElement.setBackgroundColor(start, end, span.backgroundColor)
   }
 }
 
@@ -1549,16 +1749,18 @@ function parseInlineMarkdownForDocsApi_(content) {
   let underline = false
   let color = null
   let size = null
+  let highlight = null
   let runStart = 0
   const styles = []
 
   function pushStyleSegment(endExclusive) {
     const length = endExclusive - runStart
     if (length <= 0) return
-    if (!bold && !italic && !underline && !color && !size) return
+    if (!bold && !italic && !underline && !color && !size && !highlight) return
     const span = { start: runStart, length, bold, italic, underline }
     if (color) span.foregroundColor = color
     if (size) span.fontSize = size
+    if (highlight) span.backgroundColor = highlight
     styles.push(span)
   }
 
@@ -1595,6 +1797,14 @@ function parseInlineMarkdownForDocsApi_(content) {
       continue
     }
 
+    if (content.startsWith('{/highlight}', i)) {
+      pushStyleSegment(plain.length)
+      runStart = plain.length
+      highlight = null
+      i += 12
+      continue
+    }
+
     const colorOpen = /^\{color:\s*(#[0-9a-fA-F]{6})\}/.exec(content.substring(i))
     if (colorOpen) {
       pushStyleSegment(plain.length)
@@ -1610,6 +1820,15 @@ function parseInlineMarkdownForDocsApi_(content) {
       runStart = plain.length
       size = Math.max(1, Math.min(200, Number(sizeOpen[1]) || 11))
       i += sizeOpen[0].length
+      continue
+    }
+
+    const highlightOpen = /^\{highlight:\s*(#[0-9a-fA-F]{6})\}/.exec(content.substring(i))
+    if (highlightOpen) {
+      pushStyleSegment(plain.length)
+      runStart = plain.length
+      highlight = highlightOpen[1].toLowerCase()
+      i += highlightOpen[0].length
       continue
     }
 
