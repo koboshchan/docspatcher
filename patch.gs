@@ -634,10 +634,23 @@ function markdownFromDocsApiDocumentWithLineMap_(doc, tabContext) {
     }
   }
 
+  // Collapse consecutive blank lines into at most one, and remove trailing blanks.
+  const collapsedLines = []
+  const collapsedLineMap = []
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i] === '' && collapsedLines.length > 0 && collapsedLines[collapsedLines.length - 1] === '') continue
+    collapsedLines.push(lines[i])
+    collapsedLineMap.push(lineMap[i])
+  }
+  while (collapsedLines.length > 0 && collapsedLines[collapsedLines.length - 1] === '') {
+    collapsedLines.pop()
+    collapsedLineMap.pop()
+  }
+
   return {
-    text: lines.join('\n'),
-    lines,
-    lineMap,
+    text: collapsedLines.join('\n'),
+    lines: collapsedLines,
+    lineMap: collapsedLineMap,
     hasTables,
   }
 }
@@ -898,6 +911,7 @@ function markdownTextFromTableCell_(cell) {
     segments.push(markdownTextFromParagraphElements_(block.paragraph.elements || []))
   }
 
+  while (segments.length > 0 && segments[segments.length - 1] === '') segments.pop()
   let text = segments.join('<br>').replace(/\|/g, '\\|')
   const bg = getTableCellBackgroundColor_(cell)
   if (bg) text = '{cellbg:' + bg + '}' + text
