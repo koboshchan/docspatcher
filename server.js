@@ -113,7 +113,7 @@ mcpServer.tool(
 
 mcpServer.tool(
   'getcontents',
-  'Read document content by file `id` in the custom markdown format only. Supports chunked reads with optional 1-based `startLine` and `endLine`, and optional `tabId` (defaults to document body). Returns document metadata including `title`, `lastEditedMs`, `lastEditedIso`, and `availableTabs` (tab id/title/index list). Headings are supported from `#` to `####`. Inline styles may include `**bold**`, `*italic*`, `{u}...{/u}`, `{color:#rrggbb}...{/color}`, and `{size:N}...{/size}` (font size in points). List nesting is exported with leading tabs; unordered list items use `* ` and ordered list items use `N. `.',
+  'Read document content by file `id` in the custom markdown format only. Supports chunked reads with optional 1-based `startLine` and `endLine`, and optional `tabId` (defaults to document body). Returns document metadata including `title`, `lastEditedMs`, `lastEditedIso`, and `availableTabs` (tab id/title/index list). Headings are supported from `#` to `####`. Inline styles may include `**bold**`, `*italic*`, `{u}...{/u}`, `{color:#rrggbb}...{/color}`, and `{size:N}...{/size}` (font size in points). List nesting is exported with leading tabs; unordered list items use `* ` and ordered list items use `N. `. Inline images are exported as `{img:OBJECT_ID src="url"}` where url is a time-limited Google content URI (~30 min). The OBJECT_ID is stable for the lifetime of the image in the document.',
   {
     id: z.string().min(1),
     startLine: z.number().int().min(1).optional(),
@@ -127,6 +127,13 @@ mcpServer.tool(
       result && typeof result === 'object' && !Array.isArray(result)
         ? result
         : { text: typeof result === 'string' ? result : '' }
+    if (structuredContent.error) {
+      return {
+        isError: true,
+        content: [{ type: 'text', text: structuredContent.message || structuredContent.error }],
+        structuredContent,
+      }
+    }
     const text = typeof structuredContent.text === 'string' ? structuredContent.text : ''
     return {
       content: [{ type: 'text', text }],
@@ -137,7 +144,7 @@ mcpServer.tool(
 
 mcpServer.tool(
   'applypatch',
-  'Apply a patch to a Google Doc using the custom markdown format only. Args: `id`, `patch`, optional `algorithm` (`unified` default or `dmp`), optional `tabId` (defaults to document body). Unified syntax uses hunks like `@@ -oldStart,oldCount +newStart,newCount @@` with context lines prefixed by space, removals with `-`, and additions with `+`. Headings are supported from `#` to `####`. Supported inline style tags are `**bold**`, `*italic*`, `{u}...{/u}`, `{color:#rrggbb}...{/color}`, and `{size:N}...{/size}` (font size in points). For lists, use leading tabs for nesting, `* ` or `- ` for unordered items, and `N. ` for ordered items.',
+  'Apply a patch to a Google Doc using the custom markdown format only. Args: `id`, `patch`, optional `algorithm` (`unified` default or `dmp`), optional `tabId` (defaults to document body). Unified syntax uses hunks like `@@ -oldStart,oldCount +newStart,newCount @@` with context lines prefixed by space, removals with `-`, and additions with `+`. Headings are supported from `#` to `####`. Supported inline style tags are `**bold**`, `*italic*`, `{u}...{/u}`, `{color:#rrggbb}...{/color}`, and `{size:N}...{/size}` (font size in points). For lists, use leading tabs for nesting, `* ` or `- ` for unordered items, and `N. ` for ordered items. Images use `{img:OBJECT_ID}` — the ID alone is sufficient; the src URL is looked up automatically from the document. Optionally include `src` to override: `{img:OBJECT_ID src="url"}`. Images with googleusercontent src are fetched and reinserted within the ~30 min content URI window. To insert a brand-new image use `{img:new src="https://any-accessible-url"}`.',
   {
     id: z.string().min(1),
     patch: z.string().min(1),

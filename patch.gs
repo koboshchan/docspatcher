@@ -292,8 +292,21 @@ function getContents(id, startLine, endLine, format, tabId) {
   const normalizedFormat = normalizeContentFormat_(format)
   const docInfo = getDocumentInfo_(id)
   const doc = docsApiGetDocument_(id, true)
-  const tabContext = resolveDocTabContext_(doc, tabId)
   const availableTabs = listAvailableTabs_(doc)
+
+  if (!String(tabId || '').trim()) {
+    return {
+      error: 'no_tab_id',
+      message: 'tabId is required. Please specify a tabId from availableTabs.',
+      id,
+      title: docInfo.title,
+      lastEditedMs: docInfo.lastEditedMs,
+      lastEditedIso: docInfo.lastEditedIso,
+      availableTabs,
+    }
+  }
+
+  const tabContext = resolveDocTabContext_(doc, tabId)
   const text = markdownFromDocsApiDocument_(doc, tabContext)
   const lines = text.split('\n')
   const totalLines = lines.length
@@ -468,6 +481,7 @@ function resolveDocTabContext_(doc, requestedTabId) {
       tabName: null,
       content: bodyContent,
       listsById,
+      inlineObjects: (doc && doc.inlineObjects) || {},
       requestTabId: null,
     }
   }
@@ -485,6 +499,7 @@ function resolveDocTabContext_(doc, requestedTabId) {
     tabName: String(props.title || tab.title || ''),
     content: (docTab && docTab.body && docTab.body.content) || [],
     listsById: (docTab && docTab.lists) || listsById,
+    inlineObjects: (docTab && docTab.inlineObjects) || (doc && doc.inlineObjects) || {},
     requestTabId: String(props.tabId || selectedTabId),
   }
 }
@@ -541,7 +556,8 @@ function applyPatchToDocument(id, patchText, algorithm, format, tabId) {
       dmpResults = dmpResult[2]
     }
 
-    const appliedIncrementally = applyMarkdownDiffIncremental_(id, exported, text2, tabContext)
+    const incrementalDebug = {}
+    const appliedIncrementally = applyMarkdownDiffIncremental_(id, exported, text2, tabContext, incrementalDebug)
     if (!appliedIncrementally) {
       importMarkdownIntoExistingDocument_(id, text2, tabContext)
     }
@@ -556,6 +572,7 @@ function applyPatchToDocument(id, patchText, algorithm, format, tabId) {
       results,
       dmpResults,
       textLength: text2.length,
+      incrementalDebug,
     }
   } catch (err) {
     throw createApplyPatchDebugError_(err, debugBase)
@@ -597,6 +614,7 @@ function markdownFromDocsApiDocumentWithLineMap_(doc, tabContext) {
   const context = tabContext || resolveDocTabContext_(doc)
   const content = context.content || []
   const listsById = context.listsById || {}
+  const inlineObjects = context.inlineObjects || {}
   const listState = { counters: {} }
   const lines = []
   const lineMap = []
@@ -607,7 +625,7 @@ function markdownFromDocsApiDocumentWithLineMap_(doc, tabContext) {
     if (!block) continue
 
     if (block.paragraph) {
-      lines.push(markdownLineFromParagraph_(block.paragraph, listsById, listState))
+      lines.push(markdownLineFromParagraph_(block.paragraph, listsById, listState, inlineObjects))
       lineMap.push({
         type: 'paragraph',
         startIndex: Number(block.startIndex) || null,
@@ -618,7 +636,7 @@ function markdownFromDocsApiDocumentWithLineMap_(doc, tabContext) {
 
     if (block.table) {
       hasTables = true
-      const tableLines = markdownLinesFromTable_(block.table)
+      const tableLines = markdownLinesFromTable_(block.table, inlineObjects)
       if (lines.length > 0 && lines[lines.length - 1] !== '') {
         lines.push('')
         lineMap.push({ type: 'table-gap', startIndex: null, endIndex: null })
@@ -655,7 +673,31 @@ function markdownFromDocsApiDocumentWithLineMap_(doc, tabContext) {
   }
 }
 
-function applyMarkdownDiffIncremental_(documentId, exported, nextMarkdown, tabContext) {
+// Returns [{id, docIndex}] for all inline object elements whose startIndex is in [rangeStart, rangeEnd).
+function collectInlineObjectsInRange_(content, rangeStart, rangeEnd) {
+  const result = []
+  for (let i = 0; i < (content || []).length; i++) {
+    const block = content[i]
+    if (!block || !block.paragraph) continue
+    const elems = block.paragraph.elements || []
+    for (let j = 0; j < elems.length; j++) {
+      const elem = elems[j]
+      if (
+        elem.inlineObjectElement &&
+        elem.inlineObjectElement.inlineObjectId &&
+        Number(elem.startIndex) >= rangeStart &&
+        Number(elem.startIndex) < rangeEnd
+      ) {
+        result.push({ id: elem.inlineObjectElement.inlineObjectId, docIndex: Number(elem.startIndex) })
+      }
+    }
+  }
+  result.sort(function(a, b) { return a.docIndex - b.docIndex })
+  return result
+}
+
+function applyMarkdownDiffIncremental_(documentId, exported, nextMarkdown, tabContext, _debug) {
+  const dbg = _debug || {}
   const oldLines = (exported && exported.lines) || []
   const oldMap = (exported && exported.lineMap) || []
   const newLines = String(nextMarkdown || '').split('\n')
@@ -720,6 +762,88 @@ function applyMarkdownDiffIncremental_(documentId, exported, nextMarkdown, tabCo
   const replacementLines = newStart <= newEnd ? newLines.slice(newStart, newEnd + 1) : []
   const replacementMarkdown = replacementLines.join('\n')
   const parsed = parseMarkdownDocumentForDocsApi_(replacementMarkdown)
+
+  // Selective delete path: when new content is image-only and all new images already
+  // exist in the old range, skip those image chars instead of deleting and reinserting them.
+  if (
+    deleteStart !== null && deleteEnd !== null && deleteEnd > deleteStart &&
+    parsed.text.length === 0 &&
+    context.content && context.content.length > 0
+  ) {
+    const allNewImages = []
+    for (let i = 0; i < parsed.lines.length; i++) {
+      const imgs = parsed.lines[i].images || []
+      for (let j = 0; j < imgs.length; j++) {
+        if (imgs[j].id) allNewImages.push(imgs[j])
+      }
+    }
+    if (allNewImages.length > 0) {
+      const oldImgsInRange = collectInlineObjectsInRange_(context.content, deleteStart, deleteEnd)
+      dbg.allNewImages = allNewImages
+      dbg.oldImgsInRange = oldImgsInRange
+      const newImgIds = new Set()
+      for (let i = 0; i < allNewImages.length; i++) newImgIds.add(allNewImages[i].id)
+      const keptImgs = []
+      for (let i = 0; i < oldImgsInRange.length; i++) {
+        if (newImgIds.has(oldImgsInRange[i].id)) keptImgs.push(oldImgsInRange[i])
+      }
+      const allNewKept = allNewImages.every(function(img) {
+        for (let i = 0; i < keptImgs.length; i++) { if (keptImgs[i].id === img.id) return true }
+        return false
+      })
+      if (keptImgs.length > 0 && allNewKept) {
+        dbg.selectivePath = true
+        dbg.keptImgs = keptImgs
+        dbg.deleteStart = deleteStart
+        dbg.deleteEnd = deleteEnd
+        // Collect paragraph terminator positions (must not be deleted to preserve paragraph structure)
+        const termPositions = new Set()
+        for (let i = 0; i < context.content.length; i++) {
+          const block = context.content[i]
+          if (!block || !block.paragraph) continue
+          const tp = (Number(block.endIndex) || 0) - 1
+          if (tp >= deleteStart && tp < deleteEnd) termPositions.add(tp)
+        }
+        // Build skip set: kept image positions + paragraph terminators
+        const skipsSorted = []
+        for (let i = 0; i < keptImgs.length; i++) skipsSorted.push(keptImgs[i].docIndex)
+        termPositions.forEach(function(tp) { skipsSorted.push(tp) })
+        skipsSorted.sort(function(a, b) { return a - b })
+        // Build delete segments (contiguous ranges not in skip set)
+        const segs = []
+        let prevEnd = deleteStart
+        for (let i = 0; i < skipsSorted.length; i++) {
+          const sp = skipsSorted[i]
+          if (sp < deleteStart || sp >= deleteEnd) continue
+          if (sp > prevEnd) segs.push({ start: prevEnd, end: sp })
+          prevEnd = sp + 1
+        }
+        if (prevEnd < deleteEnd) segs.push({ start: prevEnd, end: deleteEnd })
+        // Issue deletes right-to-left so indices stay valid
+        if (segs.length > 0) {
+          dbg.segs = segs
+          const selReqs = []
+          for (let s = segs.length - 1; s >= 0; s--) {
+            const range = { startIndex: segs[s].start, endIndex: segs[s].end }
+            if (context.requestTabId) range.tabId = context.requestTabId
+            selReqs.push({ deleteContentRange: { range } })
+          }
+          try {
+            docsApiBatchUpdate_(documentId, selReqs)
+          } catch (err) {
+            throw createApplyPatchDebugError_(err, {
+              phase: 'incremental-selective-delete',
+              documentId,
+              tabId: context.requestTabId || null,
+              deleteSegs: segs,
+              keptImageIds: keptImgs.map(function(ki) { return ki.id }),
+            })
+          }
+        }
+        return true
+      }
+    }
+  }
 
   const requests = []
 
@@ -819,29 +943,90 @@ function applyMarkdownDiffIncremental_(documentId, exported, nextMarkdown, tabCo
           },
         })
       }
+
+      if (line.alignment) {
+        const docsAlign = docsApiAlignmentFromString_(line.alignment)
+        if (docsAlign) {
+          const range = { startIndex: paragraphStart, endIndex: paragraphEnd }
+          if (context.requestTabId) range.tabId = context.requestTabId
+          requests.push({
+            updateParagraphStyle: {
+              range,
+              paragraphStyle: { alignment: docsAlign },
+              fields: 'alignment',
+            },
+          })
+        }
+      }
+    }
+  }
+  if (requests.length === 0) {
+    // No style/heading/list requests, but still check for images below.
+  } else {
+    try {
+      docsApiBatchUpdate_(documentId, requests)
+    } catch (err) {
+      throw createApplyPatchDebugError_(err, {
+        phase: 'incremental-batch-update',
+        documentId,
+        tabId: context.requestTabId || null,
+        oldStart,
+        oldEnd,
+        newStart,
+        newEnd,
+        insertAt,
+        deleteStart,
+        deleteEnd,
+        replacementMarkdown,
+        requestCount: requests.length,
+        failedRequest: extractFailedRequestContext_((err && err.message) || '', requests),
+      })
     }
   }
 
-  if (requests.length === 0) return true
+  // Insert new images for the replaced range.
+  const imageInserts = []
+  for (let i = 0; i < parsed.lines.length; i++) {
+    const line = parsed.lines[i]
+    const lineDocStart = insertAt + line.start
+    const imgs = line.images || []
+    for (let j = 0; j < imgs.length; j++) {
+      const img = imgs[j]
+      const url = resolveImageUrl_(img, context.inlineObjects)
+      if (!url) continue
+      imageInserts.push({ index: lineDocStart + img.offset, url })
+    }
+  }
 
-  try {
-    docsApiBatchUpdate_(documentId, requests)
-  } catch (err) {
-    throw createApplyPatchDebugError_(err, {
-      phase: 'incremental-batch-update',
-      documentId,
-      tabId: context.requestTabId || null,
-      oldStart,
-      oldEnd,
-      newStart,
-      newEnd,
-      insertAt,
-      deleteStart,
-      deleteEnd,
-      replacementMarkdown,
-      requestCount: requests.length,
-      failedRequest: extractFailedRequestContext_((err && err.message) || '', requests),
-    })
+  if (imageInserts.length > 0) {
+    imageInserts.sort(function(a, b) { return a.index - b.index })
+    const tempFileIds = resolveImageUrisToPublic_(imageInserts)
+    const imgRequests = []
+    for (let k = 0; k < imageInserts.length; k++) {
+      if (!imageInserts[k].url) continue
+      const adjustedIndex = imageInserts[k].index + k
+      const location = { index: adjustedIndex }
+      if (context.requestTabId) location.tabId = context.requestTabId
+      imgRequests.push({
+        insertInlineImage: {
+          location,
+          uri: imageInserts[k].url,
+        },
+      })
+    }
+    try {
+      if (imgRequests.length > 0) docsApiBatchUpdate_(documentId, imgRequests)
+    } catch (err) {
+      cleanupTempImageFiles_(tempFileIds)
+      throw createApplyPatchDebugError_(err, {
+        phase: 'incremental-image-insert',
+        documentId,
+        tabId: context.requestTabId || null,
+        requestCount: imgRequests.length,
+        failedRequest: extractFailedRequestContext_((err && err.message) || '', imgRequests),
+      })
+    }
+    cleanupTempImageFiles_(tempFileIds)
   }
 
   return true
@@ -865,7 +1050,7 @@ function extractFailedRequestContext_(message, requests) {
   }
 }
 
-function markdownLinesFromTable_(table) {
+function markdownLinesFromTable_(table, inlineObjects) {
   const rows = (table && table.tableRows) || []
   if (rows.length === 0) return []
 
@@ -876,7 +1061,7 @@ function markdownLinesFromTable_(table) {
     const cells = rows[r].tableCells || []
     const parsedRow = []
     for (let c = 0; c < cells.length; c++) {
-      parsedRow.push(markdownTextFromTableCell_(cells[c]))
+      parsedRow.push(markdownTextFromTableCell_(cells[c], inlineObjects))
       const colSpan = (cells[c].tableCellStyle && cells[c].tableCellStyle.columnSpan) || 1
       for (let s = 1; s < colSpan; s++) parsedRow.push('')
     }
@@ -901,14 +1086,14 @@ function markdownLinesFromTable_(table) {
   return lines
 }
 
-function markdownTextFromTableCell_(cell) {
+function markdownTextFromTableCell_(cell, inlineObjects) {
   const content = (cell && cell.content) || []
   const segments = []
 
   for (let i = 0; i < content.length; i++) {
     const block = content[i]
     if (!block || !block.paragraph) continue
-    segments.push(markdownTextFromParagraphElements_(block.paragraph.elements || []))
+    segments.push(markdownTextFromParagraphElements_(block.paragraph.elements || [], inlineObjects))
   }
 
   while (segments.length > 0 && segments[segments.length - 1] === '') segments.pop()
@@ -918,11 +1103,12 @@ function markdownTextFromTableCell_(cell) {
   return text
 }
 
-function markdownLineFromParagraph_(paragraph, listsById, listState) {
-  const paragraphText = markdownTextFromParagraphElements_(paragraph.elements || [])
+function markdownLineFromParagraph_(paragraph, listsById, listState, inlineObjects) {
+  const paragraphText = markdownTextFromParagraphElements_(paragraph.elements || [], inlineObjects)
   const headingPrefix = markdownHeadingPrefixFromParagraph_(paragraph)
   const listPrefix = markdownListPrefixFromParagraph_(paragraph, listsById, listState)
-  return headingPrefix + listPrefix + paragraphText
+  const alignPrefix = markdownAlignmentPrefixFromParagraph_(paragraph)
+  return headingPrefix + listPrefix + alignPrefix + paragraphText
 }
 
 function markdownHeadingPrefixFromParagraph_(paragraph) {
@@ -930,6 +1116,15 @@ function markdownHeadingPrefixFromParagraph_(paragraph) {
   const level = headingLevelFromNamedStyleType_(style && style.namedStyleType)
   if (!level) return ''
   return '#'.repeat(level) + ' '
+}
+
+function markdownAlignmentPrefixFromParagraph_(paragraph) {
+  const style = paragraph && paragraph.paragraphStyle
+  const alignment = String((style && style.alignment) || '').toUpperCase()
+  if (alignment === 'CENTER') return '{align:center}'
+  if (alignment === 'RIGHT') return '{align:right}'
+  if (alignment === 'JUSTIFIED') return '{align:justify}'
+  return ''
 }
 
 function headingLevelFromNamedStyleType_(namedStyleType) {
@@ -980,11 +1175,24 @@ function isOrderedListParagraph_(paragraph, listsById) {
   return /DECIMAL|ALPHA|ROMAN|NUMBER/i.test(glyphType)
 }
 
-function markdownTextFromParagraphElements_(elements) {
+function markdownTextFromParagraphElements_(elements, inlineObjects) {
   let out = ''
   for (let i = 0; i < elements.length; i++) {
     const el = elements[i]
-    if (!el || !el.textRun) continue
+    if (!el) continue
+
+    if (el.inlineObjectElement) {
+      const objectId = el.inlineObjectElement.inlineObjectId
+      const obj = inlineObjects && objectId && inlineObjects[objectId]
+      const embedded = obj && obj.inlineObjectProperties && obj.inlineObjectProperties.embeddedObject
+      if (objectId && embedded) {
+        const src = (embedded.imageProperties && embedded.imageProperties.contentUri) || ''
+        out += '{img:' + objectId + (src ? ' src="' + src + '"' : '') + '}'
+      }
+      continue
+    }
+
+    if (!el.textRun) continue
     const run = el.textRun
     const raw = String(run.content || '').replace(/\n/g, '')
     const escaped = escapeMarkdownLiteralText_(raw)
@@ -1209,10 +1417,64 @@ function importMarkdownIntoExistingDocumentWithDocsApi_(targetDocumentId, markdo
         },
       })
     }
+
+    if (line.alignment) {
+      const docsAlign = docsApiAlignmentFromString_(line.alignment)
+      if (docsAlign) {
+        const range = { startIndex: paragraphStart, endIndex: paragraphEnd }
+        if (context.requestTabId) range.tabId = context.requestTabId
+        requests.push({
+          updateParagraphStyle: {
+            range,
+            paragraphStyle: { alignment: docsAlign },
+            fields: 'alignment',
+          },
+        })
+      }
+    }
   }
 
   if (requests.length > 0) {
     docsApiBatchUpdate_(targetDocumentId, requests)
+  }
+
+  // Insert new images (contentUris from Google Docs export use googleusercontent.com, which
+  // is fetched via UrlFetchApp and uploaded to a temporary public Drive file for insertion).
+  // {img:ID} with no src will look up the contentUri from the current doc's inlineObjects.
+  const imageInserts = []
+  for (let i = 0; i < parsed.lines.length; i++) {
+    const line = parsed.lines[i]
+    const lineDocStart = line.start + 1
+    const imgs = line.images || []
+    for (let j = 0; j < imgs.length; j++) {
+      const img = imgs[j]
+      const url = resolveImageUrl_(img, context.inlineObjects)
+      if (!url) continue
+      imageInserts.push({ index: lineDocStart + img.offset, url })
+    }
+  }
+
+  if (imageInserts.length > 0) {
+    imageInserts.sort(function(a, b) { return a.index - b.index })
+    const tempFileIds = resolveImageUrisToPublic_(imageInserts)
+    const imgRequests = []
+    for (let k = 0; k < imageInserts.length; k++) {
+      if (!imageInserts[k].url) continue
+      const adjustedIndex = imageInserts[k].index + k
+      const location = { index: adjustedIndex }
+      if (context.requestTabId) location.tabId = context.requestTabId
+      imgRequests.push({
+        insertInlineImage: {
+          location,
+          uri: imageInserts[k].url,
+        },
+      })
+    }
+    try {
+      if (imgRequests.length > 0) docsApiBatchUpdate_(targetDocumentId, imgRequests)
+    } finally {
+      cleanupTempImageFiles_(tempFileIds)
+    }
   }
 }
 
@@ -1229,6 +1491,9 @@ function importMarkdownIntoExistingDocumentWithDocumentApp_(targetDocumentId, ma
   body.clear()
 
   const blocks = parseMarkdownBlocksForDocumentApp_(String(markdownText || ''))
+  // Note: images (![alt](url)) are not supported in the DocumentApp (table) path.
+  // They will be silently skipped. Use the Docs API path for documents without tables
+  // to get image insertion support.
   // listMeta tracks each list item's type and the exact text appended (tabs + content).
   // Text-based matching in fixDocumentAppListPresets_ is robust against content offset
   // uncertainties that come from body.clear() trailing paragraphs and table elements.
@@ -1263,6 +1528,10 @@ function importMarkdownIntoExistingDocumentWithDocumentApp_(targetDocumentId, ma
       const nestingTabs = '\t'.repeat(line.nestingLevel || 0)
       const fullText = nestingTabs + line.text
       const element = body.appendParagraph(fullText)
+      if (line.alignment) {
+        const ha = documentAppAlignmentFromString_(line.alignment)
+        if (ha !== null) element.setAlignment(ha)
+      }
       applyInlineStylesToTextElement_(element.editAsText(), shiftStyles_(line.styles, line.nestingLevel || 0))
       listMeta.push({ listType: line.listType, hasText: line.text.length > 0, fullText })
     } else {
@@ -1272,6 +1541,10 @@ function importMarkdownIntoExistingDocumentWithDocumentApp_(targetDocumentId, ma
         if (DocumentApp.ParagraphHeading[headingKey]) {
           element.setHeading(DocumentApp.ParagraphHeading[headingKey])
         }
+      }
+      if (line.alignment) {
+        const ha = documentAppAlignmentFromString_(line.alignment)
+        if (ha !== null) element.setAlignment(ha)
       }
       applyInlineStylesToTextElement_(element.editAsText(), line.styles)
     }
@@ -1623,6 +1896,8 @@ function parseMarkdownDocumentForDocsApi_(markdownText) {
       listType: parsedLine.listType,
       styles: shiftStyles_(parsedLine.styles, nestingTabs.length),
       nestingLevel: parsedLine.nestingLevel || 0,
+      alignment: parsedLine.alignment || null,
+      images: parsedLine.images || [],
     })
     outLines.push(lineText)
     offset += lineText.length + 1
@@ -1648,16 +1923,26 @@ function shiftStyles_(styles, offset) {
   return out
 }
 
+function extractAlignmentFromContent_(content) {
+  const m = /^\{align:(left|center|middle|right|justify)\}/i.exec(String(content || ''))
+  if (!m) return { alignment: null, content: String(content || '') }
+  const raw = m[1].toLowerCase()
+  return { alignment: raw === 'middle' ? 'center' : raw, content: String(content || '').substring(m[0].length) }
+}
+
 function parseMarkdownLineForDocsApi_(line) {
   const headingInfo = parseHeadingFromLine_(line)
   if (headingInfo) {
-    const inline = parseInlineMarkdownForDocsApi_(headingInfo.content)
+    const alignInfo = extractAlignmentFromContent_(headingInfo.content)
+    const inline = parseInlineMarkdownForDocsApi_(alignInfo.content)
     return {
       text: inline.text,
       styles: inline.styles,
+      images: inline.images || [],
       headingLevel: headingInfo.level,
       isList: false,
       listType: null,
+      alignment: alignInfo.alignment,
     }
   }
 
@@ -1665,15 +1950,19 @@ function parseMarkdownLineForDocsApi_(line) {
   if (unorderedMatch) {
     const detailed = /^([ \t]*)[-*+]\s+(.*)$/.exec(line)
     const leading = detailed ? detailed[1] : ''
-    const content = normalizeListMarkdownContent_(detailed ? detailed[2] : unorderedMatch[1])
+    const rawContent = detailed ? detailed[2] : unorderedMatch[1]
+    const alignInfo = extractAlignmentFromContent_(rawContent)
+    const content = normalizeListMarkdownContent_(alignInfo.content)
     const inline = parseInlineMarkdownForDocsApi_(content)
     return {
       text: inline.text,
       styles: inline.styles,
+      images: inline.images || [],
       headingLevel: 0,
       isList: true,
       listType: 'unordered',
       nestingLevel: listNestingLevelFromLeading_(leading),
+      alignment: alignInfo.alignment,
     }
   }
 
@@ -1681,26 +1970,33 @@ function parseMarkdownLineForDocsApi_(line) {
   if (orderedMatch) {
     const detailed = /^([ \t]*)\d+\.\s+(.*)$/.exec(line)
     const leading = detailed ? detailed[1] : ''
-    const content = normalizeListMarkdownContent_(detailed ? detailed[2] : orderedMatch[1])
+    const rawContent = detailed ? detailed[2] : orderedMatch[1]
+    const alignInfo = extractAlignmentFromContent_(rawContent)
+    const content = normalizeListMarkdownContent_(alignInfo.content)
     const inline = parseInlineMarkdownForDocsApi_(content)
     return {
       text: inline.text,
       styles: inline.styles,
+      images: inline.images || [],
       headingLevel: 0,
       isList: true,
       listType: 'ordered',
       nestingLevel: listNestingLevelFromLeading_(leading),
+      alignment: alignInfo.alignment,
     }
   }
 
-  const inline = parseInlineMarkdownForDocsApi_(line)
+  const alignInfo = extractAlignmentFromContent_(line)
+  const inline = parseInlineMarkdownForDocsApi_(alignInfo.content)
   return {
     text: inline.text,
     styles: inline.styles,
+    images: inline.images || [],
     headingLevel: 0,
     isList: false,
     listType: null,
     nestingLevel: 0,
+    alignment: alignInfo.alignment,
   }
 }
 
@@ -1773,6 +2069,7 @@ function parseInlineMarkdownForDocsApi_(content) {
   let highlight = null
   let runStart = 0
   const styles = []
+  const images = []
 
   function pushStyleSegment(endExclusive) {
     const length = endExclusive - runStart
@@ -1786,6 +2083,39 @@ function parseInlineMarkdownForDocsApi_(content) {
   }
 
   while (i < content.length) {
+    // Image: {img:ID} or {img:ID src="url"}
+    if (content.startsWith('{img:', i)) {
+      const tagEnd = content.indexOf('}', i + 5)
+      if (tagEnd !== -1) {
+        pushStyleSegment(plain.length)
+        runStart = plain.length
+        const tagInner = content.substring(i + 5, tagEnd)
+        const srcMatch = /\ssrc="([^"]*)"/.exec(tagInner)
+        const id = srcMatch ? tagInner.substring(0, tagInner.indexOf(' ')) : tagInner
+        const url = srcMatch ? srcMatch[1] : ''
+        images.push({ offset: plain.length, id, url })
+        i = tagEnd + 1
+        continue
+      }
+    }
+
+    // Legacy image: ![alt](url)
+    if (content.charAt(i) === '!' && content.charAt(i + 1) === '[') {
+      const altClose = content.indexOf(']', i + 2)
+      if (altClose !== -1 && content.charAt(altClose + 1) === '(') {
+        const urlClose = content.indexOf(')', altClose + 2)
+        if (urlClose !== -1) {
+          pushStyleSegment(plain.length)
+          runStart = plain.length
+          const alt = content.substring(i + 2, altClose)
+          const url = content.substring(altClose + 2, urlClose)
+          images.push({ offset: plain.length, id: null, url, alt })
+          i = urlClose + 1
+          continue
+        }
+      }
+    }
+
     if (content.startsWith('{/u}', i)) {
       pushStyleSegment(plain.length)
       runStart = plain.length
@@ -1899,7 +2229,7 @@ function parseInlineMarkdownForDocsApi_(content) {
   }
 
   pushStyleSegment(plain.length)
-  return { text: plain, styles }
+  return { text: plain, styles, images }
 }
 
 function hexToRgbColor_(hex) {
@@ -1910,6 +2240,62 @@ function hexToRgbColor_(hex) {
     red: parseInt(raw.substring(0, 2), 16) / 255,
     green: parseInt(raw.substring(2, 4), 16) / 255,
     blue: parseInt(raw.substring(4, 6), 16) / 255,
+  }
+}
+
+function docsApiAlignmentFromString_(alignment) {
+  const a = String(alignment || '').toLowerCase()
+  if (a === 'center' || a === 'middle') return 'CENTER'
+  if (a === 'right') return 'RIGHT'
+  if (a === 'justify') return 'JUSTIFIED'
+  if (a === 'left') return 'START'
+  return null
+}
+
+function documentAppAlignmentFromString_(alignment) {
+  const a = String(alignment || '').toLowerCase()
+  if (a === 'center' || a === 'middle') return DocumentApp.HorizontalAlignment.CENTER
+  if (a === 'right') return DocumentApp.HorizontalAlignment.RIGHT
+  if (a === 'justify') return DocumentApp.HorizontalAlignment.JUSTIFY
+  if (a === 'left') return DocumentApp.HorizontalAlignment.LEFT
+  return null
+}
+
+// Resolves the URL for an image token. If the token has a url, returns it directly.
+// If only an id is provided, looks up the contentUri from inlineObjects.
+function resolveImageUrl_(img, inlineObjects) {
+  if (img.url) return img.url
+  if (!img.id || !inlineObjects) return ''
+  const obj = inlineObjects[img.id]
+  const embedded = obj && obj.inlineObjectProperties && obj.inlineObjectProperties.embeddedObject
+  return (embedded && embedded.imageProperties && embedded.imageProperties.contentUri) || ''
+}
+
+// For each image insert that has a googleusercontent URL, fetches the image blob,// uploads it as a temporary Drive file (set to public read), and replaces the URL
+// with the public Drive download URL. Returns an array of temp Drive file IDs for
+// cleanup via cleanupTempImageFiles_.
+function resolveImageUrisToPublic_(imageInserts) {
+  const tempFileIds = []
+  for (let i = 0; i < imageInserts.length; i++) {
+    const img = imageInserts[i]
+    if (!img.url || !/googleusercontent\.com/i.test(img.url)) continue
+    try {
+      const resp = UrlFetchApp.fetch(img.url, { muteHttpExceptions: true })
+      if (resp.getResponseCode() !== 200) { img.url = ''; continue }
+      const tmpFile = DriveApp.createFile(resp.getBlob())
+      tmpFile.setSharing(DriveApp.Access.ANYONE, DriveApp.Permission.VIEW)
+      img.url = 'https://drive.google.com/uc?export=download&id=' + tmpFile.getId()
+      tempFileIds.push(tmpFile.getId())
+    } catch (e) {
+      img.url = ''
+    }
+  }
+  return tempFileIds
+}
+
+function cleanupTempImageFiles_(tempFileIds) {
+  for (let i = 0; i < tempFileIds.length; i++) {
+    try { DriveApp.getFileById(tempFileIds[i]).setTrashed(true) } catch (e) {}
   }
 }
 
