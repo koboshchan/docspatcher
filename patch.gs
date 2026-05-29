@@ -1308,23 +1308,30 @@ function findDocumentAppTab_(tabs, targetId) {
 
 function fixDocumentAppTableMerges_(documentId, tableMeta, tabContext) {
   const tabId = tabContext && tabContext.requestTabId ? tabContext.requestTabId : null
-  const doc = docsApiGetDocument_(documentId, true)
-  const resolvedContext = resolveDocTabContext_(doc, tabId)
-  const content = resolvedContext.content || []
 
-  // Collect table start indices in document order.
-  const tableStartIndices = []
-  for (let i = 0; i < content.length; i++) {
-    if (content[i] && content[i].table) {
-      tableStartIndices.push(content[i].startIndex)
-    }
-  }
-
-  const requests = []
+  // Process each table's merges in a separate batchUpdate call. Merging cells
+  // inside table N removes characters, which shifts the startIndex of every
+  // subsequent table. Re-reading the document before each table gives fresh,
+  // correct indices that account for those shifts.
   for (let t = 0; t < tableMeta.length; t++) {
     const meta = tableMeta[t]
+    if (!meta.merges || meta.merges.length === 0) continue
+
+    const doc = docsApiGetDocument_(documentId, true)
+    const resolvedContext = resolveDocTabContext_(doc, tabId)
+    const content = resolvedContext.content || []
+
+    const tableStartIndices = []
+    for (let i = 0; i < content.length; i++) {
+      if (content[i] && content[i].table) {
+        tableStartIndices.push(content[i].startIndex)
+      }
+    }
+
     const tableIdx = tableStartIndices[meta.tableOrder]
     if (tableIdx == null) continue
+
+    const requests = []
     for (let m = 0; m < meta.merges.length; m++) {
       const merge = meta.merges[m]
       const tableCellLocation = {
@@ -1343,10 +1350,10 @@ function fixDocumentAppTableMerges_(documentId, tableMeta, tabContext) {
         },
       })
     }
-  }
 
-  if (requests.length > 0) {
-    docsApiBatchUpdate_(documentId, requests)
+    if (requests.length > 0) {
+      docsApiBatchUpdate_(documentId, requests)
+    }
   }
 }
 
