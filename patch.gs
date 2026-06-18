@@ -248,6 +248,20 @@ function buildBridgeHtml_(wsUrl, token) {
             return
           }
 
+          if (msg.method === 'execute_ot_patch') {
+            google.script.run
+              .withSuccessHandler((result) => {
+                logLine('execute_ot_patch success')
+                sendResult(id, result)
+              })
+              .withFailureHandler((err) => {
+                logLine('execute_ot_patch failure')
+                sendError(id, err && err.message)
+              })
+              .mcp_executeOtPatch(params.id, params.tabId, params.operations)
+            return
+          }
+
           sendError(id, 'Unknown method: ' + msg.method)
         })
       })()
@@ -288,6 +302,10 @@ function mcp_applyPatch(id, patchText, algorithm, format, tabId) {
   return applyPatchToDocument(id, patchText, algorithm, format, tabId)
 }
 
+function mcp_executeOtPatch(id, tabId, operations) {
+  return executeOtPatch(id, tabId, operations)
+}
+
 function getContents(id, startLine, endLine, format, tabId) {
   const normalizedFormat = normalizeContentFormat_(format)
   const docInfo = getDocumentInfo_(id)
@@ -307,7 +325,8 @@ function getContents(id, startLine, endLine, format, tabId) {
   }
 
   const tabContext = resolveDocTabContext_(doc, tabId)
-  const text = markdownFromDocsApiDocument_(doc, tabContext)
+  const linearData = getLinearTextAndMap_(doc, tabContext)
+  const text = linearData.text
   const lines = text.split('\n')
   const totalLines = lines.length
 
@@ -344,6 +363,7 @@ function getContents(id, startLine, endLine, format, tabId) {
     totalLines,
     hasMore: end < totalLines,
     text: lines.slice(start - 1, end).join('\n'),
+    elementMap: linearData.elementMap
   }
 }
 
@@ -522,70 +542,434 @@ function applyPatchToDocument(id, patchText, algorithm, format, tabId) {
   const dmp = new diff_match_patch()
   const mode = (algorithm || 'unified').toLowerCase()
   const normalizedFormat = normalizeContentFormat_(format)
-  const debugBase = {
-    documentId: id,
-    algorithm: mode === 'unified' ? 'unified' : 'dmp',
-    format: normalizedFormat,
-    tabId: tabId || null,
-    patchText,
-  }
 
   try {
     const doc = docsApiGetDocument_(id, true)
     const tabContext = resolveDocTabContext_(doc, tabId)
-    const exported = markdownFromDocsApiDocumentWithLineMap_(doc, tabContext)
-    const markdown = exported.text
-    let text2
-    let patchesOrHunks
-    let results
-    let dmpResults
+    const linearData = getLinearTextAndMap_(doc, tabContext)
+    const originalText = linearData.text
+    const elementMap = linearData.elementMap
 
+    let text2
     if (mode === 'unified') {
       const hunks = parseUnifiedHunks_(patchText)
-      const unifiedResult = applyUnifiedHunksToText_(markdown, hunks)
-      const dmpApplied = applyTextTransitionWithDmpString_(markdown, unifiedResult[0], dmp)
-      text2 = dmpApplied.text
-      results = unifiedResult[1]
-      dmpResults = dmpApplied.results
-      patchesOrHunks = hunks
+      const unifiedResult = applyUnifiedHunksToText_(originalText, hunks)
+      text2 = unifiedResult[0]
     } else {
-      const dmpResult = applyPatchToText_(markdown, patchText, dmp)
+      const dmpResult = applyPatchToText_(originalText, patchText, dmp)
       text2 = dmpResult[0]
-      patchesOrHunks = dmpResult[1]
-      results = dmpResult[2]
-      dmpResults = dmpResult[2]
     }
 
-    const incrementalDebug = {}
-    const appliedIncrementally = applyMarkdownDiffIncremental_(id, exported, text2, tabContext, incrementalDebug)
-    if (!appliedIncrementally) {
-      importMarkdownIntoExistingDocument_(id, text2, tabContext)
-    }
+    const linearOps = getLinearOperations_(originalText, text2, dmp)
+    const docOps = translateOpsToDocOps_(linearOps, elementMap, tabContext.requestTabId, tabContext.inlineObjects)
+
+    const appliedOperationsCount = applyDocOpsToDocument_(id, tabContext, docOps)
 
     return {
-      algorithm: mode === 'unified' ? 'unified' : 'dmp',
+      algorithm: mode,
       format: normalizedFormat,
       tabId: tabContext.tabId || null,
       tabName: tabContext.tabName || null,
-      appliedIncrementally,
-      patches: patchesOrHunks.length,
-      results,
-      dmpResults,
-      textLength: text2.length,
-      incrementalDebug,
+      success: true,
+      appliedOperationsCount: appliedOperationsCount
     }
   } catch (err) {
-    throw createApplyPatchDebugError_(err, debugBase)
+    throw new Error('applyPatchToDocument failed: ' + String(err.message || err))
   }
 }
 
-function createApplyPatchDebugError_(err, debugData) {
-  const message = String((err && err.message) || err || 'Unknown applypatch error')
-  const payload = {
-    error: message,
-    patchDebug: debugData || {},
+function executeOtPatch(id, tabId, operations) {
+  try {
+    const doc = docsApiGetDocument_(id, true)
+    const tabContext = resolveDocTabContext_(doc, tabId)
+    const linearData = getLinearTextAndMap_(doc, tabContext)
+    const originalText = linearData.text
+    const elementMap = linearData.elementMap
+
+    const linearOps = getLinearOpsFromOt_(operations)
+    const docOps = translateOpsToDocOps_(linearOps, elementMap, tabContext.requestTabId, tabContext.inlineObjects)
+
+    const appliedOperationsCount = applyDocOpsToDocument_(id, tabContext, docOps)
+
+    return {
+      success: true,
+      appliedOperationsCount: appliedOperationsCount
+    }
+  } catch (err) {
+    throw new Error('execute_ot_patch failed: ' + String(err.message || err))
   }
-  return new Error('applypatch failed: ' + JSON.stringify(payload))
+}
+
+function applyDocOpsToDocument_(id, tabContext, docOps) {
+  docOps.sort((a, b) => {
+    const idxA = a.type === 'delete' ? a.startIndex : a.index
+    const idxB = b.type === 'delete' ? b.startIndex : b.index
+    if (idxB !== idxA) {
+      return idxB - idxA
+    }
+    if (a.type !== b.type) {
+      return a.type === 'delete' ? -1 : 1
+    }
+    return 0
+  })
+
+  const requests = []
+  const tempFileIds = []
+
+  try {
+    for (let i = 0; i < docOps.length; i++) {
+      const op = docOps[i]
+      if (op.type === 'delete') {
+        const range = { startIndex: op.startIndex, endIndex: op.endIndex }
+        if (tabContext.requestTabId) range.tabId = tabContext.requestTabId
+        requests.push({ deleteContentRange: { range } })
+      } else if (op.type === 'insert_text') {
+        const location = { index: op.index }
+        if (tabContext.requestTabId) location.tabId = tabContext.requestTabId
+        requests.push({ insertText: { location, text: op.text } })
+      } else if (op.type === 'insert_image') {
+        let url = ''
+        if (op.src) {
+          url = op.src
+        } else {
+          url = resolveImageUrl_({ id: op.objectId }, tabContext.inlineObjects)
+        }
+
+        if (url) {
+          const tempInserts = [{ index: op.index, url: url }]
+          const newTempFileIds = resolveImageUrisToPublic_(tempInserts)
+          tempFileIds.push(...newTempFileIds)
+
+          const location = { index: op.index }
+          if (tabContext.requestTabId) location.tabId = tabContext.requestTabId
+          requests.push({
+            insertInlineImage: {
+              location,
+              uri: tempInserts[0].url
+            }
+          })
+        }
+      }
+    }
+
+    if (requests.length > 0) {
+      docsApiBatchUpdate_(id, requests)
+    }
+
+    return requests.length
+  } finally {
+    if (tempFileIds.length > 0) {
+      cleanupTempImageFiles_(tempFileIds)
+    }
+  }
+}
+
+function getLinearTextAndMap_(doc, tabContext) {
+  const context = tabContext || resolveDocTabContext_(doc)
+  const content = context.content || []
+  const listsById = context.listsById || {}
+  const listState = { counters: {} }
+
+  let linearText = ''
+  const elementMap = []
+
+  for (let i = 0; i < content.length; i++) {
+    const block = content[i]
+    if (!block) continue
+
+    if (block.paragraph) {
+      const paragraph = block.paragraph
+      const docStart = Number(block.startIndex)
+      const docEnd = Number(block.endIndex)
+
+      const linearStart = linearText.length
+      const parts = []
+      let paraLinearText = ''
+
+      const headingPrefix = markdownHeadingPrefixFromParagraph_(paragraph)
+      const listPrefix = markdownListPrefixFromParagraph_(paragraph, listsById, listState)
+      const alignPrefix = markdownAlignmentPrefixFromParagraph_(paragraph)
+      const prefix = headingPrefix + listPrefix + alignPrefix
+
+      if (prefix.length > 0) {
+        paraLinearText += prefix
+        parts.push({ type: 'prefix', linearLen: prefix.length, docLen: 0 })
+      }
+
+      const elements = paragraph.elements || []
+      for (let j = 0; j < elements.length; j++) {
+        const el = elements[j]
+        if (!el) continue
+
+        const elStart = Number(el.startIndex)
+        const elEnd = Number(el.endIndex)
+        const elLen = elEnd - elStart
+
+        if (el.inlineObjectElement) {
+          const objectId = el.inlineObjectElement.inlineObjectId
+          const token = '\uFFFC[image:' + objectId + ']'
+          paraLinearText += token
+          parts.push({
+            type: 'image',
+            linearLen: token.length,
+            docLen: elLen,
+            objectId: objectId
+          })
+        } else if (el.textRun) {
+          const contentText = el.textRun.content || ''
+          const endsWithNL = contentText.endsWith('\n')
+          const runText = endsWithNL ? contentText.slice(0, -1) : contentText
+
+          if (runText.length > 0) {
+            paraLinearText += runText
+            parts.push({
+              type: 'text',
+              linearLen: runText.length,
+              docLen: runText.length
+            })
+          }
+        }
+      }
+
+      paraLinearText += '\n'
+      parts.push({ type: 'terminator', linearLen: 1, docLen: 1 })
+
+      linearText += paraLinearText
+      const linearEnd = linearText.length
+
+      elementMap.push({
+        type: 'paragraph',
+        linearStart: linearStart,
+        linearEnd: linearEnd,
+        docStart: docStart,
+        docEnd: docEnd,
+        parts: parts
+      })
+    } else if (block.table) {
+      const docStart = Number(block.startIndex)
+      const docEnd = Number(block.endIndex)
+
+      const linearStart = linearText.length
+      const token = '\uFFFC[table:' + docStart + ']\n'
+      linearText += token
+      const linearEnd = linearText.length
+
+      elementMap.push({
+        type: 'table',
+        linearStart: linearStart,
+        linearEnd: linearEnd,
+        docStart: docStart,
+        docEnd: docEnd,
+        parts: [
+          { type: 'table', linearLen: token.length, docLen: docEnd - docStart }
+        ]
+      })
+    }
+  }
+
+  return {
+    text: linearText,
+    elementMap: elementMap
+  }
+}
+
+function translateLinearToDocIndex(linearIndex, elementMap) {
+  if (elementMap.length === 0) return 1
+
+  const lastDocEnd = elementMap[elementMap.length - 1].docEnd
+  let docIndex = 1
+  let found = false
+
+  for (let i = 0; i < elementMap.length; i++) {
+    const entry = elementMap[i]
+    if (linearIndex >= entry.linearStart && linearIndex <= entry.linearEnd) {
+      const relIndex = linearIndex - entry.linearStart
+      const parts = entry.parts || []
+
+      let currentLinearRel = 0
+      let currentDocRel = 0
+
+      for (let j = 0; j < parts.length; j++) {
+        const part = parts[j]
+        const partLinearEnd = currentLinearRel + part.linearLen
+
+        if (relIndex >= currentLinearRel && relIndex <= partLinearEnd) {
+          if (part.type === 'prefix' || part.type === 'image' || part.type === 'table') {
+            docIndex = entry.docStart + currentDocRel
+          } else {
+            docIndex = entry.docStart + currentDocRel + (relIndex - currentLinearRel)
+          }
+          found = true
+          break
+        }
+
+        currentLinearRel += part.linearLen
+        currentDocRel += part.docLen
+      }
+
+      if (found) break
+      docIndex = entry.docEnd
+      found = true
+      break
+    }
+  }
+
+  if (!found) {
+    const last = elementMap[elementMap.length - 1]
+    if (linearIndex >= last.linearEnd) {
+      docIndex = last.docEnd
+    } else {
+      docIndex = elementMap[0].docStart
+    }
+  }
+
+  if (docIndex >= lastDocEnd) {
+    return lastDocEnd - 1
+  }
+  return docIndex
+}
+
+function getLinearOperations_(oldText, newText, dmp) {
+  const diffs = dmp.diff_main(oldText, newText, false)
+  dmp.diff_cleanupSemantic(diffs)
+
+  let linearIndex = 0
+  const ops = []
+
+  for (let i = 0; i < diffs.length; i++) {
+    const diff = diffs[i]
+    const op = diff[0]
+    const chunk = diff[1]
+    if (!chunk) continue
+
+    if (op === DIFF_EQUAL) {
+      linearIndex += chunk.length
+    } else if (op === DIFF_DELETE) {
+      ops.push({
+        type: 'delete',
+        linearStart: linearIndex,
+        linearEnd: linearIndex + chunk.length
+      })
+      linearIndex += chunk.length
+    } else if (op === DIFF_INSERT) {
+      ops.push({
+        type: 'insert',
+        linearStart: linearIndex,
+        text: chunk
+      })
+    }
+  }
+
+  return ops
+}
+
+function getLinearOpsFromOt_(operations) {
+  let linearIndex = 0
+  const ops = []
+
+  for (let i = 0; i < operations.length; i++) {
+    const op = operations[i]
+    if (op.type === 'retain') {
+      linearIndex += op.count
+    } else if (op.type === 'delete') {
+      ops.push({
+        type: 'delete',
+        linearStart: linearIndex,
+        linearEnd: linearIndex + op.count
+      })
+      linearIndex += op.count
+    } else if (op.type === 'insert') {
+      ops.push({
+        type: 'insert',
+        linearStart: linearIndex,
+        text: op.text
+      })
+    }
+  }
+
+  return ops
+}
+
+function processInsertionText_(text, tabId, inlineObjects) {
+  let cleanText = text.replace(/\uFFFC\[table:\d+\]\n?/g, '[Table]\n')
+
+  const imageRegex = /\uFFFC\[image:([^\s\]]+)(?:\ssrc="([^"]*)")?\]/g
+  let match
+  const parts = []
+  let lastIndex = 0
+
+  while ((match = imageRegex.exec(cleanText)) !== null) {
+    const matchIndex = match.index
+    const objectId = match[1]
+    const src = match[2] || ''
+
+    if (matchIndex > lastIndex) {
+      parts.push({
+        type: 'text',
+        text: cleanText.substring(lastIndex, matchIndex)
+      })
+    }
+
+    parts.push({
+      type: 'image',
+      objectId: objectId,
+      src: src
+    })
+
+    lastIndex = imageRegex.lastIndex
+  }
+
+  if (lastIndex < cleanText.length) {
+    parts.push({
+      type: 'text',
+      text: cleanText.substring(lastIndex)
+    })
+  }
+
+  return parts
+}
+
+function translateOpsToDocOps_(linearOps, elementMap, tabId, inlineObjects) {
+  const docOps = []
+  for (let i = 0; i < linearOps.length; i++) {
+    const op = linearOps[i]
+    if (op.type === 'delete') {
+      const docStart = translateLinearToDocIndex(op.linearStart, elementMap)
+      const docEnd = translateLinearToDocIndex(op.linearEnd, elementMap)
+      if (docEnd > docStart) {
+        docOps.push({
+          type: 'delete',
+          startIndex: docStart,
+          endIndex: docEnd
+        })
+      }
+    } else if (op.type === 'insert') {
+      const docIndex = translateLinearToDocIndex(op.linearStart, elementMap)
+      const parts = processInsertionText_(op.text, tabId, inlineObjects)
+      let currentOffset = 0
+
+      for (let j = 0; j < parts.length; j++) {
+        const part = parts[j]
+        if (part.type === 'text') {
+          docOps.push({
+            type: 'insert_text',
+            index: docIndex + currentOffset,
+            text: part.text
+          })
+          currentOffset += part.text.length
+        } else if (part.type === 'image') {
+          docOps.push({
+            type: 'insert_image',
+            index: docIndex + currentOffset,
+            objectId: part.objectId,
+            src: part.src
+          })
+          currentOffset += 1
+        }
+      }
+    }
+  }
+  return docOps
 }
 
 function normalizeContentFormat_(format) {
@@ -596,519 +980,12 @@ function normalizeContentFormat_(format) {
   return 'markdown'
 }
 
-function exportDocumentAsMarkdown_(documentId, tabId) {
-  const doc = docsApiGetDocument_(documentId, true)
-  const tabContext = resolveDocTabContext_(doc, tabId)
-  return markdownFromDocsApiDocument_(doc, tabContext)
-}
-
-function importMarkdownIntoExistingDocument_(targetDocumentId, markdownText, tabContext) {
-  importMarkdownIntoExistingDocumentWithDocsApi_(targetDocumentId, markdownText, tabContext)
-}
-
-function markdownFromDocsApiDocument_(doc, tabContext) {
-  return markdownFromDocsApiDocumentWithLineMap_(doc, tabContext).text
-}
-
-function markdownFromDocsApiDocumentWithLineMap_(doc, tabContext) {
-  const context = tabContext || resolveDocTabContext_(doc)
-  const content = context.content || []
-  const listsById = context.listsById || {}
-  const inlineObjects = context.inlineObjects || {}
-  const listState = { counters: {} }
-  const lines = []
-  const lineMap = []
-  let hasTables = false
-
-  for (let i = 0; i < content.length; i++) {
-    const block = content[i]
-    if (!block) continue
-
-    if (block.paragraph) {
-      lines.push(markdownLineFromParagraph_(block.paragraph, listsById, listState, inlineObjects))
-      lineMap.push({
-        type: 'paragraph',
-        startIndex: Number(block.startIndex) || null,
-        endIndex: Number(block.endIndex) || null,
-      })
-      continue
-    }
-
-    if (block.table) {
-      hasTables = true
-      const tableLines = markdownLinesFromTable_(block.table, inlineObjects)
-      if (lines.length > 0 && lines[lines.length - 1] !== '') {
-        lines.push('')
-        lineMap.push({ type: 'table-gap', startIndex: null, endIndex: null })
-      }
-      for (let t = 0; t < tableLines.length; t++) {
-        lines.push(tableLines[t])
-        lineMap.push({ type: 'table', startIndex: null, endIndex: null })
-      }
-      if (i < content.length - 1) {
-        lines.push('')
-        lineMap.push({ type: 'table-gap', startIndex: null, endIndex: null })
-      }
-    }
-  }
-
-  // Collapse consecutive blank lines into at most one, and remove trailing blanks.
-  const collapsedLines = []
-  const collapsedLineMap = []
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i] === '' && collapsedLines.length > 0 && collapsedLines[collapsedLines.length - 1] === '') continue
-    collapsedLines.push(lines[i])
-    collapsedLineMap.push(lineMap[i])
-  }
-  while (collapsedLines.length > 0 && collapsedLines[collapsedLines.length - 1] === '') {
-    collapsedLines.pop()
-    collapsedLineMap.pop()
-  }
-
-  return {
-    text: collapsedLines.join('\n'),
-    lines: collapsedLines,
-    lineMap: collapsedLineMap,
-    hasTables,
-  }
-}
-
-// Returns [{id, docIndex}] for all inline object elements whose startIndex is in [rangeStart, rangeEnd).
-function collectInlineObjectsInRange_(content, rangeStart, rangeEnd) {
-  const result = []
-  for (let i = 0; i < (content || []).length; i++) {
-    const block = content[i]
-    if (!block || !block.paragraph) continue
-    const elems = block.paragraph.elements || []
-    for (let j = 0; j < elems.length; j++) {
-      const elem = elems[j]
-      if (
-        elem.inlineObjectElement &&
-        elem.inlineObjectElement.inlineObjectId &&
-        Number(elem.startIndex) >= rangeStart &&
-        Number(elem.startIndex) < rangeEnd
-      ) {
-        result.push({ id: elem.inlineObjectElement.inlineObjectId, docIndex: Number(elem.startIndex) })
-      }
-    }
-  }
-  result.sort(function(a, b) { return a.docIndex - b.docIndex })
-  return result
-}
-
-function applyMarkdownDiffIncremental_(documentId, exported, nextMarkdown, tabContext, _debug) {
-  const dbg = _debug || {}
-  const oldLines = (exported && exported.lines) || []
-  const oldMap = (exported && exported.lineMap) || []
-  const newLines = String(nextMarkdown || '').split('\n')
-  const context = tabContext || { requestTabId: null }
-
-  if (exported && exported.hasTables) return false
-  if (containsMarkdownTableSyntax_(nextMarkdown)) return false
-
-  let prefix = 0
-  while (
-    prefix < oldLines.length &&
-    prefix < newLines.length &&
-    oldLines[prefix] === newLines[prefix]
-  ) {
-    prefix++
-  }
-
-  let suffix = 0
-  while (
-    suffix < oldLines.length - prefix &&
-    suffix < newLines.length - prefix &&
-    oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
-  ) {
-    suffix++
-  }
-
-  const oldStart = prefix
-  const oldEnd = oldLines.length - suffix - 1
-  const newStart = prefix
-  const newEnd = newLines.length - suffix - 1
-
-  if (oldStart > oldEnd && newStart > newEnd) return true
-
-  let insertAt = null
-  let deleteStart = null
-  let deleteEnd = null
-
-  if (oldStart <= oldEnd) {
-    const first = oldMap[oldStart]
-    const last = oldMap[oldEnd]
-    if (!first || !last) return false
-    if (!(first.startIndex > 0) || !(last.endIndex > first.startIndex)) return false
-    insertAt = first.startIndex
-    deleteStart = first.startIndex
-    deleteEnd = last.endIndex
-  } else if (oldMap.length > 0) {
-    if (oldStart < oldMap.length) {
-      const at = oldMap[oldStart]
-      if (!at || !(at.startIndex > 0)) return false
-      insertAt = at.startIndex
-    } else {
-      const tail = oldMap[oldMap.length - 1]
-      if (!tail || !(tail.endIndex > 0)) return false
-      insertAt = tail.endIndex
-    }
-  } else {
-    insertAt = 1
-  }
-
-  if (!(insertAt > 0)) return false
-
-  const replacementLines = newStart <= newEnd ? newLines.slice(newStart, newEnd + 1) : []
-  const replacementMarkdown = replacementLines.join('\n')
-  const parsed = parseMarkdownDocumentForDocsApi_(replacementMarkdown)
-
-  // Selective delete path: when new content is image-only and all new images already
-  // exist in the old range, skip those image chars instead of deleting and reinserting them.
-  if (
-    deleteStart !== null && deleteEnd !== null && deleteEnd > deleteStart &&
-    parsed.text.length === 0 &&
-    context.content && context.content.length > 0
-  ) {
-    const allNewImages = []
-    for (let i = 0; i < parsed.lines.length; i++) {
-      const imgs = parsed.lines[i].images || []
-      for (let j = 0; j < imgs.length; j++) {
-        if (imgs[j].id) allNewImages.push(imgs[j])
-      }
-    }
-    if (allNewImages.length > 0) {
-      const oldImgsInRange = collectInlineObjectsInRange_(context.content, deleteStart, deleteEnd)
-      dbg.allNewImages = allNewImages
-      dbg.oldImgsInRange = oldImgsInRange
-      const newImgIds = new Set()
-      for (let i = 0; i < allNewImages.length; i++) newImgIds.add(allNewImages[i].id)
-      const keptImgs = []
-      for (let i = 0; i < oldImgsInRange.length; i++) {
-        if (newImgIds.has(oldImgsInRange[i].id)) keptImgs.push(oldImgsInRange[i])
-      }
-      const allNewKept = allNewImages.every(function(img) {
-        for (let i = 0; i < keptImgs.length; i++) { if (keptImgs[i].id === img.id) return true }
-        return false
-      })
-      if (keptImgs.length > 0 && allNewKept) {
-        dbg.selectivePath = true
-        dbg.keptImgs = keptImgs
-        dbg.deleteStart = deleteStart
-        dbg.deleteEnd = deleteEnd
-        // Collect paragraph terminator positions (must not be deleted to preserve paragraph structure)
-        const termPositions = new Set()
-        for (let i = 0; i < context.content.length; i++) {
-          const block = context.content[i]
-          if (!block || !block.paragraph) continue
-          const tp = (Number(block.endIndex) || 0) - 1
-          if (tp >= deleteStart && tp < deleteEnd) termPositions.add(tp)
-        }
-        // Build skip set: kept image positions + paragraph terminators
-        const skipsSorted = []
-        for (let i = 0; i < keptImgs.length; i++) skipsSorted.push(keptImgs[i].docIndex)
-        termPositions.forEach(function(tp) { skipsSorted.push(tp) })
-        skipsSorted.sort(function(a, b) { return a - b })
-        // Build delete segments (contiguous ranges not in skip set)
-        const segs = []
-        let prevEnd = deleteStart
-        for (let i = 0; i < skipsSorted.length; i++) {
-          const sp = skipsSorted[i]
-          if (sp < deleteStart || sp >= deleteEnd) continue
-          if (sp > prevEnd) segs.push({ start: prevEnd, end: sp })
-          prevEnd = sp + 1
-        }
-        if (prevEnd < deleteEnd) segs.push({ start: prevEnd, end: deleteEnd })
-        // Issue deletes right-to-left so indices stay valid
-        if (segs.length > 0) {
-          dbg.segs = segs
-          const selReqs = []
-          for (let s = segs.length - 1; s >= 0; s--) {
-            const range = { startIndex: segs[s].start, endIndex: segs[s].end }
-            if (context.requestTabId) range.tabId = context.requestTabId
-            selReqs.push({ deleteContentRange: { range } })
-          }
-          try {
-            docsApiBatchUpdate_(documentId, selReqs)
-          } catch (err) {
-            throw createApplyPatchDebugError_(err, {
-              phase: 'incremental-selective-delete',
-              documentId,
-              tabId: context.requestTabId || null,
-              deleteSegs: segs,
-              keptImageIds: keptImgs.map(function(ki) { return ki.id }),
-            })
-          }
-        }
-        return true
-      }
-    }
-  }
-
-  const requests = []
-
-  if (deleteStart !== null && deleteEnd !== null && deleteEnd > deleteStart) {
-    const range = { startIndex: deleteStart, endIndex: deleteEnd }
-    if (context.requestTabId) range.tabId = context.requestTabId
-    requests.push({ deleteContentRange: { range } })
-  }
-
-  if (parsed.text.length > 0) {
-    const location = { index: insertAt }
-    if (context.requestTabId) location.tabId = context.requestTabId
-    requests.push({
-      insertText: {
-        location,
-        text: parsed.text,
-      },
-    })
-
-    for (let i = 0; i < parsed.lines.length; i++) {
-      const line = parsed.lines[i]
-      const paragraphStart = insertAt + line.start
-      const paragraphEnd = paragraphStart + line.text.length + 1
-
-      if (line.headingLevel > 0) {
-        const range = { startIndex: paragraphStart, endIndex: paragraphEnd }
-        if (context.requestTabId) range.tabId = context.requestTabId
-        requests.push({
-          updateParagraphStyle: {
-            range,
-            paragraphStyle: {
-              namedStyleType: namedStyleTypeFromHeadingLevel_(line.headingLevel),
-            },
-            fields: 'namedStyleType',
-          },
-        })
-      }
-
-      if (line.isList && line.text.length > 0) {
-        const range = { startIndex: paragraphStart, endIndex: paragraphEnd }
-        if (context.requestTabId) range.tabId = context.requestTabId
-        requests.push({
-          createParagraphBullets: {
-            range,
-            bulletPreset: line.listType === 'ordered' ? 'NUMBERED_DECIMAL_NESTED' : 'BULLET_DISC_CIRCLE_SQUARE',
-          },
-        })
-      }
-
-      for (let j = 0; j < line.styles.length; j++) {
-        const span = line.styles[j]
-        const startIndex = paragraphStart + span.start
-        const endIndex = startIndex + span.length
-        if (endIndex <= startIndex) continue
-
-        const style = {}
-        const fields = []
-        if (span.bold) {
-          style.bold = true
-          fields.push('bold')
-        }
-        if (span.italic) {
-          style.italic = true
-          fields.push('italic')
-        }
-        if (span.underline) {
-          style.underline = true
-          fields.push('underline')
-        }
-        if (span.foregroundColor) {
-          const rgb = hexToRgbColor_(span.foregroundColor)
-          if (rgb) {
-            style.foregroundColor = { color: { rgbColor: rgb } }
-            fields.push('foregroundColor')
-          }
-        }
-        if (span.backgroundColor) {
-          const bgRgb = hexToRgbColor_(span.backgroundColor)
-          if (bgRgb) {
-            style.backgroundColor = { color: { rgbColor: bgRgb } }
-            fields.push('backgroundColor')
-          }
-        }
-        if (span.fontSize) {
-          style.fontSize = { magnitude: Number(span.fontSize), unit: 'PT' }
-          fields.push('fontSize')
-        }
-        if (fields.length === 0) continue
-
-        const range = { startIndex, endIndex }
-        if (context.requestTabId) range.tabId = context.requestTabId
-        requests.push({
-          updateTextStyle: {
-            range,
-            textStyle: style,
-            fields: fields.join(','),
-          },
-        })
-      }
-
-      if (line.alignment) {
-        const docsAlign = docsApiAlignmentFromString_(line.alignment)
-        if (docsAlign) {
-          const range = { startIndex: paragraphStart, endIndex: paragraphEnd }
-          if (context.requestTabId) range.tabId = context.requestTabId
-          requests.push({
-            updateParagraphStyle: {
-              range,
-              paragraphStyle: { alignment: docsAlign },
-              fields: 'alignment',
-            },
-          })
-        }
-      }
-    }
-  }
-  if (requests.length === 0) {
-    // No style/heading/list requests, but still check for images below.
-  } else {
-    try {
-      docsApiBatchUpdate_(documentId, requests)
-    } catch (err) {
-      throw createApplyPatchDebugError_(err, {
-        phase: 'incremental-batch-update',
-        documentId,
-        tabId: context.requestTabId || null,
-        oldStart,
-        oldEnd,
-        newStart,
-        newEnd,
-        insertAt,
-        deleteStart,
-        deleteEnd,
-        replacementMarkdown,
-        requestCount: requests.length,
-        failedRequest: extractFailedRequestContext_((err && err.message) || '', requests),
-      })
-    }
-  }
-
-  // Insert new images for the replaced range.
-  const imageInserts = []
-  for (let i = 0; i < parsed.lines.length; i++) {
-    const line = parsed.lines[i]
-    const lineDocStart = insertAt + line.start
-    const imgs = line.images || []
-    for (let j = 0; j < imgs.length; j++) {
-      const img = imgs[j]
-      const url = resolveImageUrl_(img, context.inlineObjects)
-      if (!url) continue
-      imageInserts.push({ index: lineDocStart + img.offset, url })
-    }
-  }
-
-  if (imageInserts.length > 0) {
-    imageInserts.sort(function(a, b) { return a.index - b.index })
-    const tempFileIds = resolveImageUrisToPublic_(imageInserts)
-    const imgRequests = []
-    for (let k = 0; k < imageInserts.length; k++) {
-      if (!imageInserts[k].url) continue
-      const adjustedIndex = imageInserts[k].index + k
-      const location = { index: adjustedIndex }
-      if (context.requestTabId) location.tabId = context.requestTabId
-      imgRequests.push({
-        insertInlineImage: {
-          location,
-          uri: imageInserts[k].url,
-        },
-      })
-    }
-    try {
-      if (imgRequests.length > 0) docsApiBatchUpdate_(documentId, imgRequests)
-    } catch (err) {
-      cleanupTempImageFiles_(tempFileIds)
-      throw createApplyPatchDebugError_(err, {
-        phase: 'incremental-image-insert',
-        documentId,
-        tabId: context.requestTabId || null,
-        requestCount: imgRequests.length,
-        failedRequest: extractFailedRequestContext_((err && err.message) || '', imgRequests),
-      })
-    }
-    cleanupTempImageFiles_(tempFileIds)
-  }
-
-  return true
-}
-
-function extractFailedRequestContext_(message, requests) {
-  const m = /requests\[(\d+)\]/.exec(String(message || ''))
-  if (!m) {
-    return {
-      index: null,
-      context: requests.slice(0, Math.min(5, requests.length)),
-    }
-  }
-
-  const index = Number(m[1])
-  const start = Math.max(0, index - 2)
-  const end = Math.min(requests.length, index + 3)
-  return {
-    index,
-    context: requests.slice(start, end),
-  }
-}
-
-function markdownLinesFromTable_(table, inlineObjects) {
-  const rows = (table && table.tableRows) || []
-  if (rows.length === 0) return []
-
-  const parsedRows = []
-  let maxCols = 0
-
-  for (let r = 0; r < rows.length; r++) {
-    const cells = rows[r].tableCells || []
-    const parsedRow = []
-    for (let c = 0; c < cells.length; c++) {
-      parsedRow.push(markdownTextFromTableCell_(cells[c], inlineObjects))
-      const colSpan = (cells[c].tableCellStyle && cells[c].tableCellStyle.columnSpan) || 1
-      for (let s = 1; s < colSpan; s++) parsedRow.push('')
-    }
-    if (parsedRow.length > maxCols) maxCols = parsedRow.length
-    parsedRows.push(parsedRow)
-  }
-
-  if (maxCols === 0) return []
-
-  for (let r = 0; r < parsedRows.length; r++) {
-    while (parsedRows[r].length < maxCols) parsedRows[r].push('')
-  }
-
-  const lines = []
-  lines.push('| ' + parsedRows[0].join(' | ') + ' |')
-  lines.push('| ' + Array(maxCols).fill(':----').join(' | ') + ' |')
-
-  for (let r = 1; r < parsedRows.length; r++) {
-    lines.push('| ' + parsedRows[r].join(' | ') + ' |')
-  }
-
-  return lines
-}
-
-function markdownTextFromTableCell_(cell, inlineObjects) {
-  const content = (cell && cell.content) || []
-  const segments = []
-
-  for (let i = 0; i < content.length; i++) {
-    const block = content[i]
-    if (!block || !block.paragraph) continue
-    segments.push(markdownTextFromParagraphElements_(block.paragraph.elements || [], inlineObjects))
-  }
-
-  while (segments.length > 0 && segments[segments.length - 1] === '') segments.pop()
-  let text = segments.join('<br>').replace(/\|/g, '\\|')
-  const bg = getTableCellBackgroundColor_(cell)
-  if (bg) text = '{cellbg:' + bg + '}' + text
-  return text
-}
-
-function markdownLineFromParagraph_(paragraph, listsById, listState, inlineObjects) {
-  const paragraphText = markdownTextFromParagraphElements_(paragraph.elements || [], inlineObjects)
-  const headingPrefix = markdownHeadingPrefixFromParagraph_(paragraph)
-  const listPrefix = markdownListPrefixFromParagraph_(paragraph, listsById, listState)
-  const alignPrefix = markdownAlignmentPrefixFromParagraph_(paragraph)
-  return headingPrefix + listPrefix + alignPrefix + paragraphText
+function getDocsParagraphText_(paragraph) {
+  const elements = (paragraph && paragraph.elements) || []
+  return elements
+    .map(function(e) { return (e.textRun && e.textRun.content) || '' })
+    .join('')
+    .replace(/\n$/, '')
 }
 
 function markdownHeadingPrefixFromParagraph_(paragraph) {
@@ -1175,1061 +1052,13 @@ function isOrderedListParagraph_(paragraph, listsById) {
   return /DECIMAL|ALPHA|ROMAN|NUMBER/i.test(glyphType)
 }
 
-function markdownTextFromParagraphElements_(elements, inlineObjects) {
-  let out = ''
-  for (let i = 0; i < elements.length; i++) {
-    const el = elements[i]
-    if (!el) continue
-
-    if (el.inlineObjectElement) {
-      const objectId = el.inlineObjectElement.inlineObjectId
-      const obj = inlineObjects && objectId && inlineObjects[objectId]
-      const embedded = obj && obj.inlineObjectProperties && obj.inlineObjectProperties.embeddedObject
-      if (objectId && embedded) {
-        const src = (embedded.imageProperties && embedded.imageProperties.contentUri) || ''
-        out += '{img:' + objectId + (src ? ' src="' + src + '"' : '') + '}'
-      }
-      continue
-    }
-
-    if (!el.textRun) continue
-    const run = el.textRun
-    const raw = String(run.content || '').replace(/\n/g, '')
-    const escaped = escapeMarkdownLiteralText_(raw)
-    out += applyMarkdownInlineStyle_(escaped, run.textStyle || {})
-  }
-  return out
-}
-
-function escapeMarkdownLiteralText_(text) {
-  return String(text)
-    .replace(/\\/g, '\\\\')
-    .replace(/\*/g, '\\*')
-    .replace(/\{/g, '\\{')
-    .replace(/\}/g, '\\}')
-}
-
-function applyMarkdownInlineStyle_(text, style) {
-  const hasBold = !!(style && style.bold)
-  const hasItalic = !!(style && style.italic)
-  const hasUnderline = !!(style && style.underline)
-  const color = getHexColorFromTextStyle_(style)
-  const size = getFontSizeFromTextStyle_(style)
-  const highlight = getHighlightColorFromTextStyle_(style)
-
-  let out = text
-  if (hasBold && hasItalic) out = '***' + out + '***'
-  else if (hasBold) out = '**' + out + '**'
-  else if (hasItalic) out = '*' + out + '*'
-  if (hasUnderline) out = '{u}' + out + '{/u}'
-
-  if (size) out = '{size:' + size + '}' + out + '{/size}'
-  if (color) out = '{color:' + color + '}' + out + '{/color}'
-  if (highlight) out = '{highlight:' + highlight + '}' + out + '{/highlight}'
-  return out
-}
-
-function getHexColorFromTextStyle_(style) {
-  const foreground = style && style.foregroundColor
-  const rgb =
-    (foreground && foreground.color && foreground.color.rgbColor) ||
-    (foreground && foreground.opaqueColor && foreground.opaqueColor.rgbColor) ||
-    (foreground && foreground.rgbColor)
-  if (!rgb) return null
-
-  function toHexChannel_(n) {
-    const v = Math.max(0, Math.min(255, Math.round((Number(n) || 0) * 255)))
-    const h = v.toString(16)
-    return h.length === 1 ? '0' + h : h
-  }
-
-  return (
-    '#' +
-    toHexChannel_(rgb.red) +
-    toHexChannel_(rgb.green) +
-    toHexChannel_(rgb.blue)
-  )
-}
-
-function getFontSizeFromTextStyle_(style) {
-  const fs = style && style.fontSize
-  if (!fs) return null
-
-  if (typeof fs === 'number') {
-    if (fs <= 0) return null
-    return Math.round(fs)
-  }
-
-  const magnitude = Number(fs.magnitude)
-  if (!(magnitude > 0)) return null
-  return Math.round(magnitude)
-}
-
-function getHighlightColorFromTextStyle_(style) {
-  const bg = style && style.backgroundColor
-  const rgb =
-    (bg && bg.color && bg.color.rgbColor) ||
-    (bg && bg.opaqueColor && bg.opaqueColor.rgbColor) ||
-    (bg && bg.rgbColor)
-  if (!rgb) return null
-
-  function toHexChannel_(n) {
-    const v = Math.max(0, Math.min(255, Math.round((Number(n) || 0) * 255)))
-    const h = v.toString(16)
-    return h.length === 1 ? '0' + h : h
-  }
-
-  const hex =
-    '#' +
-    toHexChannel_(rgb.red) +
-    toHexChannel_(rgb.green) +
-    toHexChannel_(rgb.blue)
-  return hex === '#ffffff' ? null : hex
-}
-
-function getTableCellBackgroundColor_(cell) {
-  const style = cell && cell.tableCellStyle
-  const bg = style && style.backgroundColor
-  const rgb =
-    (bg && bg.color && bg.color.rgbColor) ||
-    (bg && bg.opaqueColor && bg.opaqueColor.rgbColor) ||
-    (bg && bg.rgbColor)
-  if (!rgb) return null
-
-  function toHexChannel_(n) {
-    const v = Math.max(0, Math.min(255, Math.round((Number(n) || 0) * 255)))
-    const h = v.toString(16)
-    return h.length === 1 ? '0' + h : h
-  }
-
-  const hex =
-    '#' +
-    toHexChannel_(rgb.red) +
-    toHexChannel_(rgb.green) +
-    toHexChannel_(rgb.blue)
-  return hex === '#ffffff' ? null : hex
-}
-
-function importMarkdownIntoExistingDocumentWithDocsApi_(targetDocumentId, markdownText, tabContext) {
-  if (containsMarkdownTableSyntax_(markdownText)) {
-    importMarkdownIntoExistingDocumentWithDocumentApp_(targetDocumentId, markdownText, tabContext)
-    return
-  }
-
-  const context =
-    tabContext || resolveDocTabContext_(docsApiGetDocument_(targetDocumentId, true))
-  const parsed = parseMarkdownDocumentForDocsApi_(String(markdownText || ''))
-  clearDocumentViaDocsApi_(targetDocumentId, context)
-
-  if (parsed.text.length > 0) {
-    const location = { index: 1 }
-    if (context.requestTabId) location.tabId = context.requestTabId
-    docsApiBatchUpdate_(targetDocumentId, [
-      {
-        insertText: {
-          location,
-          text: parsed.text,
-        },
-      },
-    ])
-  }
-
-  const requests = []
-
-  for (let i = 0; i < parsed.lines.length; i++) {
-    const line = parsed.lines[i]
-    const paragraphStart = line.start + 1
-    const paragraphEnd = paragraphStart + line.text.length + 1
-
-    if (line.headingLevel > 0) {
-      const range = { startIndex: paragraphStart, endIndex: paragraphEnd }
-      if (context.requestTabId) range.tabId = context.requestTabId
-      requests.push({
-        updateParagraphStyle: {
-          range,
-          paragraphStyle: {
-            namedStyleType: namedStyleTypeFromHeadingLevel_(line.headingLevel),
-          },
-          fields: 'namedStyleType',
-        },
-      })
-    }
-
-    if (line.isList && line.text.length > 0) {
-      const range = { startIndex: paragraphStart, endIndex: paragraphEnd }
-      if (context.requestTabId) range.tabId = context.requestTabId
-      requests.push({
-        createParagraphBullets: {
-          range,
-          bulletPreset: line.listType === 'ordered' ? 'NUMBERED_DECIMAL_NESTED' : 'BULLET_DISC_CIRCLE_SQUARE',
-        },
-      })
-    }
-
-    for (let j = 0; j < line.styles.length; j++) {
-      const span = line.styles[j]
-      const startIndex = paragraphStart + span.start
-      const endIndex = startIndex + span.length
-      if (endIndex <= startIndex) continue
-
-      const style = {}
-      const fields = []
-      if (span.bold) {
-        style.bold = true
-        fields.push('bold')
-      }
-      if (span.italic) {
-        style.italic = true
-        fields.push('italic')
-      }
-      if (span.underline) {
-        style.underline = true
-        fields.push('underline')
-      }
-      if (span.foregroundColor) {
-        const rgb = hexToRgbColor_(span.foregroundColor)
-        if (rgb) {
-          style.foregroundColor = { color: { rgbColor: rgb } }
-          fields.push('foregroundColor')
-        }
-      }
-      if (span.backgroundColor) {
-        const bgRgb = hexToRgbColor_(span.backgroundColor)
-        if (bgRgb) {
-          style.backgroundColor = { color: { rgbColor: bgRgb } }
-          fields.push('backgroundColor')
-        }
-      }
-      if (span.fontSize) {
-        style.fontSize = { magnitude: Number(span.fontSize), unit: 'PT' }
-        fields.push('fontSize')
-      }
-      if (fields.length === 0) continue
-
-      const range = { startIndex, endIndex }
-      if (context.requestTabId) range.tabId = context.requestTabId
-
-      requests.push({
-        updateTextStyle: {
-          range,
-          textStyle: style,
-          fields: fields.join(','),
-        },
-      })
-    }
-
-    if (line.alignment) {
-      const docsAlign = docsApiAlignmentFromString_(line.alignment)
-      if (docsAlign) {
-        const range = { startIndex: paragraphStart, endIndex: paragraphEnd }
-        if (context.requestTabId) range.tabId = context.requestTabId
-        requests.push({
-          updateParagraphStyle: {
-            range,
-            paragraphStyle: { alignment: docsAlign },
-            fields: 'alignment',
-          },
-        })
-      }
-    }
-  }
-
-  if (requests.length > 0) {
-    docsApiBatchUpdate_(targetDocumentId, requests)
-  }
-
-  // Insert new images (contentUris from Google Docs export use googleusercontent.com, which
-  // is fetched via UrlFetchApp and uploaded to a temporary public Drive file for insertion).
-  // {img:ID} with no src will look up the contentUri from the current doc's inlineObjects.
-  const imageInserts = []
-  for (let i = 0; i < parsed.lines.length; i++) {
-    const line = parsed.lines[i]
-    const lineDocStart = line.start + 1
-    const imgs = line.images || []
-    for (let j = 0; j < imgs.length; j++) {
-      const img = imgs[j]
-      const url = resolveImageUrl_(img, context.inlineObjects)
-      if (!url) continue
-      imageInserts.push({ index: lineDocStart + img.offset, url })
-    }
-  }
-
-  if (imageInserts.length > 0) {
-    imageInserts.sort(function(a, b) { return a.index - b.index })
-    const tempFileIds = resolveImageUrisToPublic_(imageInserts)
-    const imgRequests = []
-    for (let k = 0; k < imageInserts.length; k++) {
-      if (!imageInserts[k].url) continue
-      const adjustedIndex = imageInserts[k].index + k
-      const location = { index: adjustedIndex }
-      if (context.requestTabId) location.tabId = context.requestTabId
-      imgRequests.push({
-        insertInlineImage: {
-          location,
-          uri: imageInserts[k].url,
-        },
-      })
-    }
-    try {
-      if (imgRequests.length > 0) docsApiBatchUpdate_(targetDocumentId, imgRequests)
-    } finally {
-      cleanupTempImageFiles_(tempFileIds)
-    }
-  }
-}
-
-function importMarkdownIntoExistingDocumentWithDocumentApp_(targetDocumentId, markdownText, tabContext) {
-  const doc = DocumentApp.openById(targetDocumentId)
-  let body
-  if (tabContext && tabContext.requestTabId) {
-    const tab = findDocumentAppTab_(doc.getTabs(), tabContext.requestTabId)
-    if (!tab) throw new Error('Tab not found in DocumentApp: ' + tabContext.requestTabId)
-    body = tab.asDocumentTab().getBody()
-  } else {
-    body = doc.getBody()
-  }
-  body.clear()
-
-  const blocks = parseMarkdownBlocksForDocumentApp_(String(markdownText || ''))
-  // Note: images (![alt](url)) are not supported in the DocumentApp (table) path.
-  // They will be silently skipped. Use the Docs API path for documents without tables
-  // to get image insertion support.
-  // listMeta tracks each list item's type and the exact text appended (tabs + content).
-  // Text-based matching in fixDocumentAppListPresets_ is robust against content offset
-  // uncertainties that come from body.clear() trailing paragraphs and table elements.
-  const listMeta = []
-  // tableMeta tracks tables with merged cells that need post-processing via Docs API.
-  const tableMeta = []
-
-  for (let i = 0; i < blocks.length; i++) {
-    const block = blocks[i]
-
-    if (block.type === 'table') {
-      const table = body.appendTable(block.rows.map((row) => row.map((cell) => cell.text)))
-      for (let r = 0; r < block.rows.length; r++) {
-        for (let c = 0; c < block.rows[r].length; c++) {
-          const cellSpec = block.rows[r][c]
-          const tableCell = table.getCell(r, c)
-          applyInlineStylesToTextElement_(tableCell.editAsText(), cellSpec.styles)
-          if (cellSpec.backgroundColor) tableCell.setBackgroundColor(cellSpec.backgroundColor)
-        }
-      }
-      if (block.merges && block.merges.length > 0) {
-        tableMeta.push({ tableOrder: tableMeta.length, merges: block.merges })
-      }
-      continue
-    }
-
-    const line = parseMarkdownLineForDocsApi_(block.text)
-    if (line.isList) {
-      // Use appendParagraph (NOT appendListItem) so the paragraph has no bullet yet.
-      // createParagraphBullets only infers nesting from leading tabs and applies the
-      // correct preset on plain paragraphs; it cannot re-nest existing list items.
-      const nestingTabs = '\t'.repeat(line.nestingLevel || 0)
-      const fullText = nestingTabs + line.text
-      const element = body.appendParagraph(fullText)
-      if (line.alignment) {
-        const ha = documentAppAlignmentFromString_(line.alignment)
-        if (ha !== null) element.setAlignment(ha)
-      }
-      applyInlineStylesToTextElement_(element.editAsText(), shiftStyles_(line.styles, line.nestingLevel || 0))
-      listMeta.push({ listType: line.listType, hasText: line.text.length > 0, fullText })
-    } else {
-      const element = body.appendParagraph(line.text)
-      if (line.headingLevel > 0) {
-        const headingKey = 'HEADING' + line.headingLevel
-        if (DocumentApp.ParagraphHeading[headingKey]) {
-          element.setHeading(DocumentApp.ParagraphHeading[headingKey])
-        }
-      }
-      if (line.alignment) {
-        const ha = documentAppAlignmentFromString_(line.alignment)
-        if (ha !== null) element.setAlignment(ha)
-      }
-      applyInlineStylesToTextElement_(element.editAsText(), line.styles)
-    }
-  }
-
-  // IMPORTANT: saveAndClose() before switching to the Docs REST API.
-  // Apps Script warns that mixing DocumentApp and Docs API on the same document
-  // causes race conditions — DocumentApp holds a write session that conflicts with
-  // REST API changes.  saveAndClose() commits all pending DocumentApp writes so the
-  // subsequent Docs API reads and createParagraphBullets requests see correct indices.
-  doc.saveAndClose()
-
-  // Apply merged cells via Docs API before list presets (merges alter table structure).
-  if (tableMeta.length > 0) {
-    fixDocumentAppTableMerges_(targetDocumentId, tableMeta, tabContext)
-  }
-
-  // Apply correct bullet presets and nesting via Docs API.
-  // DocumentApp's setGlyphType is unreliable for nested ordered items; the Docs API
-  // createParagraphBullets preset is the authoritative way to configure list glyphs.
-  if (listMeta.length > 0) {
-    fixDocumentAppListPresets_(targetDocumentId, listMeta, tabContext)
-  }
-}
-
-function findDocumentAppTab_(tabs, targetId) {
-  for (let i = 0; i < tabs.length; i++) {
-    if (tabs[i].getId() === targetId) return tabs[i]
-    const nested = findDocumentAppTab_(tabs[i].getChildTabs(), targetId)
-    if (nested) return nested
-  }
+function docsApiAlignmentFromString_(alignment) {
+  const a = String(alignment || '').toLowerCase()
+  if (a === 'center' || a === 'middle') return 'CENTER'
+  if (a === 'right') return 'RIGHT'
+  if (a === 'justify') return 'JUSTIFIED'
+  if (a === 'left') return 'START'
   return null
-}
-
-function fixDocumentAppTableMerges_(documentId, tableMeta, tabContext) {
-  const tabId = tabContext && tabContext.requestTabId ? tabContext.requestTabId : null
-
-  // Process each table's merges in a separate batchUpdate call. Merging cells
-  // inside table N removes characters, which shifts the startIndex of every
-  // subsequent table. Re-reading the document before each table gives fresh,
-  // correct indices that account for those shifts.
-  for (let t = 0; t < tableMeta.length; t++) {
-    const meta = tableMeta[t]
-    if (!meta.merges || meta.merges.length === 0) continue
-
-    const doc = docsApiGetDocument_(documentId, true)
-    const resolvedContext = resolveDocTabContext_(doc, tabId)
-    const content = resolvedContext.content || []
-
-    const tableStartIndices = []
-    for (let i = 0; i < content.length; i++) {
-      if (content[i] && content[i].table) {
-        tableStartIndices.push(content[i].startIndex)
-      }
-    }
-
-    const tableIdx = tableStartIndices[meta.tableOrder]
-    if (tableIdx == null) continue
-
-    const requests = []
-    for (let m = 0; m < meta.merges.length; m++) {
-      const merge = meta.merges[m]
-      const tableCellLocation = {
-        tableStartLocation: { index: tableIdx },
-        rowIndex: merge.rowIndex,
-        columnIndex: merge.colIndex,
-      }
-      if (tabId) tableCellLocation.tableStartLocation.tabId = tabId
-      requests.push({
-        mergeTableCells: {
-          tableRange: {
-            tableCellLocation,
-            rowSpan: merge.rowSpan,
-            columnSpan: merge.colSpan,
-          },
-        },
-      })
-    }
-
-    if (requests.length > 0) {
-      docsApiBatchUpdate_(documentId, requests)
-    }
-  }
-}
-
-function fixDocumentAppListPresets_(documentId, listMeta, tabContext) {
-  // Re-read via Docs API and match each list item to its paragraph by text content.
-  // Text matching avoids fragile index arithmetic (body.clear() trailing paragraphs,
-  // table elements, etc. make absolute content[] offsets unreliable).
-  const tabId = tabContext && tabContext.requestTabId ? tabContext.requestTabId : null
-  const doc = docsApiGetDocument_(documentId, true)
-  const resolvedContext = resolveDocTabContext_(doc, tabId)
-  const content = resolvedContext.content || []
-
-  // Collect plain (non-bullet) paragraphs with their text and doc indices.
-  const plainParas = []
-  for (let i = 0; i < content.length; i++) {
-    const el = content[i]
-    if (el && el.paragraph && !el.paragraph.bullet) {
-      const text = getDocsParagraphText_(el.paragraph)
-      plainParas.push({ text, start: el.startIndex, end: el.endIndex, used: false })
-    }
-  }
-
-  // Match each list item to the next unused paragraph whose text equals fullText.
-  // Build a flat matched[] array (null for unmatched/empty items) in insertion order.
-  const matched = []
-  for (let i = 0; i < listMeta.length; i++) {
-    const meta = listMeta[i]
-    if (!meta.hasText) { matched.push(null); continue }
-
-    let found = null
-    for (let j = 0; j < plainParas.length; j++) {
-      if (!plainParas[j].used && plainParas[j].text === meta.fullText) {
-        found = plainParas[j]
-        plainParas[j].used = true
-        break
-      }
-    }
-    matched.push(found ? { listType: meta.listType, start: found.start, end: found.end } : null)
-  }
-
-  // Group consecutive matched items of the same listType that are adjacent in the
-  // document (endIndex of one paragraph === startIndex of the next). A single
-  // createParagraphBullets call covering the whole group lets the Docs API infer
-  // nesting level from leading tab characters — calling it per-paragraph would give
-  // each item its own list with no nesting context.
-  const groups = []
-  let i = 0
-  while (i < matched.length) {
-    if (!matched[i]) { i++; continue }
-    const group = [matched[i]]
-    while (
-      i + 1 < matched.length &&
-      matched[i + 1] &&
-      matched[i + 1].listType === group[0].listType &&
-      matched[i + 1].start === group[group.length - 1].end
-    ) {
-      i++
-      group.push(matched[i])
-    }
-    groups.push(group)
-    i++
-  }
-
-  // One createParagraphBullets request per group spanning its full range.
-  const requests = []
-  for (let g = 0; g < groups.length; g++) {
-    const group = groups[g]
-    const start = group[0].start
-    const end = group[group.length - 1].end
-    if (!(end > start)) continue
-    const range = { startIndex: start, endIndex: end }
-    if (tabId) range.tabId = tabId
-    requests.push({
-      createParagraphBullets: {
-        range,
-        bulletPreset: group[0].listType === 'ordered' ? 'NUMBERED_DECIMAL_NESTED' : 'BULLET_DISC_CIRCLE_SQUARE',
-      },
-    })
-  }
-
-  if (requests.length === 0) return
-
-  // Apply in reverse document order so index shifts from tab removal don't
-  // invalidate the start/end indices of earlier (lower-index) groups.
-  requests.sort(function(a, b) {
-    return (b.createParagraphBullets.range.startIndex || 0) - (a.createParagraphBullets.range.startIndex || 0)
-  })
-
-  docsApiBatchUpdate_(documentId, requests)
-}
-
-function getDocsParagraphText_(paragraph) {
-  const elements = (paragraph && paragraph.elements) || []
-  return elements
-    .map(function(e) { return (e.textRun && e.textRun.content) || '' })
-    .join('')
-    .replace(/\n$/, '')
-}
-
-function parseMarkdownBlocksForDocumentApp_(markdownText) {
-  const lines = String(markdownText || '').replace(/\r\n/g, '\n').split('\n')
-  const blocks = []
-  let i = 0
-
-  while (i < lines.length) {
-    const line = lines[i]
-
-    if (isMarkdownTableRowLine_(line) && i + 1 < lines.length && isMarkdownTableSeparatorLine_(lines[i + 1])) {
-      const tableLines = [line]
-      i += 2
-
-      while (i < lines.length && isMarkdownTableRowLine_(lines[i])) {
-        tableLines.push(lines[i])
-        i++
-      }
-
-      const rows = parseMarkdownTableRows_(tableLines)
-      if (rows.length > 0) {
-        const merges = computeTableMerges_(rows)
-        blocks.push({ type: 'table', rows, merges })
-      }
-      continue
-    }
-
-    blocks.push({ type: 'paragraph', text: line })
-    i++
-  }
-
-  return blocks
-}
-
-function computeTableMerges_(rows) {
-  const merges = []
-  for (let r = 0; r < rows.length; r++) {
-    let c = 0
-    while (c < rows[r].length) {
-      const cell = rows[r][c]
-      if (cell.text || cell.backgroundColor) {
-        let span = 1
-        while (
-          c + span < rows[r].length &&
-          !rows[r][c + span].text &&
-          !rows[r][c + span].backgroundColor
-        ) {
-          span++
-        }
-        if (span > 1) {
-          merges.push({ rowIndex: r, colIndex: c, rowSpan: 1, colSpan: span })
-        }
-        c += span
-      } else {
-        c++
-      }
-    }
-  }
-  return merges
-}
-
-function isMarkdownTableRowLine_(line) {
-  return /^\s*\|.*\|\s*$/.test(String(line || ''))
-}
-
-function isMarkdownTableSeparatorLine_(line) {
-  return /^\s*\|\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|\s*$/.test(String(line || ''))
-}
-
-function parseMarkdownTableRows_(tableLines) {
-  const rows = []
-  let maxCols = 0
-
-  for (let i = 0; i < tableLines.length; i++) {
-    const cellsRaw = splitMarkdownTableRowCells_(tableLines[i])
-    const cells = []
-    for (let c = 0; c < cellsRaw.length; c++) {
-      const rawCell = cellsRaw[c].replace(/<br\s*\/?\s*>/gi, '\n')
-      const bgMatch = /^\{cellbg:(#[0-9a-fA-F]{6})\}/.exec(rawCell)
-      const backgroundColor = bgMatch ? bgMatch[1].toLowerCase() : null
-      const cellContent = bgMatch ? rawCell.substring(bgMatch[0].length) : rawCell
-      const inline = parseInlineMarkdownForDocsApi_(cellContent)
-      cells.push({ text: inline.text, styles: inline.styles, backgroundColor })
-    }
-    if (cells.length > maxCols) maxCols = cells.length
-    rows.push(cells)
-  }
-
-  for (let r = 0; r < rows.length; r++) {
-    while (rows[r].length < maxCols) {
-      rows[r].push({ text: '', styles: [], backgroundColor: null })
-    }
-  }
-
-  return rows
-}
-
-function splitMarkdownTableRowCells_(line) {
-  const raw = String(line || '').trim().replace(/^\|/, '').replace(/\|$/, '')
-  const parts = []
-  let cur = ''
-  let escaping = false
-
-  for (let i = 0; i < raw.length; i++) {
-    const ch = raw.charAt(i)
-    if (escaping) {
-      cur += ch
-      escaping = false
-      continue
-    }
-    if (ch === '\\') {
-      escaping = true
-      continue
-    }
-    if (ch === '|') {
-      parts.push(cur.trim())
-      cur = ''
-      continue
-    }
-    cur += ch
-  }
-  parts.push(cur.trim())
-
-  return parts
-}
-
-function applyInlineStylesToTextElement_(textElement, styles) {
-  if (!textElement || !styles || styles.length === 0) return
-  for (let i = 0; i < styles.length; i++) {
-    const span = styles[i]
-    const start = span.start
-    const end = span.start + span.length - 1
-    if (end < start) continue
-    if (span.bold) textElement.setBold(start, end, true)
-    if (span.italic) textElement.setItalic(start, end, true)
-    if (span.underline) textElement.setUnderline(start, end, true)
-    if (span.foregroundColor) textElement.setForegroundColor(start, end, span.foregroundColor)
-    if (span.fontSize) textElement.setFontSize(start, end, Number(span.fontSize))
-    if (span.backgroundColor) textElement.setBackgroundColor(start, end, span.backgroundColor)
-  }
-}
-
-function containsMarkdownTableSyntax_(markdownText) {
-  const lines = String(markdownText || '').split(/\r?\n/)
-  for (let i = 0; i < lines.length - 1; i++) {
-    if (!/^\s*\|.*\|\s*$/.test(lines[i])) continue
-    if (/^\s*\|\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|\s*$/.test(lines[i + 1])) {
-      return true
-    }
-  }
-  return false
-}
-
-function parseMarkdownDocumentForDocsApi_(markdownText) {
-  const src = String(markdownText || '').replace(/\r\n/g, '\n')
-  const srcLines = src.split('\n')
-  const lines = []
-  const outLines = []
-  let offset = 0
-
-  for (let i = 0; i < srcLines.length; i++) {
-    const parsedLine = parseMarkdownLineForDocsApi_(srcLines[i])
-    const nestingTabs = parsedLine.isList ? '\t'.repeat(parsedLine.nestingLevel || 0) : ''
-    const lineText = nestingTabs + parsedLine.text
-    lines.push({
-      start: offset,
-      text: lineText,
-      headingLevel: parsedLine.headingLevel,
-      isList: parsedLine.isList,
-      listType: parsedLine.listType,
-      styles: shiftStyles_(parsedLine.styles, nestingTabs.length),
-      nestingLevel: parsedLine.nestingLevel || 0,
-      alignment: parsedLine.alignment || null,
-      images: parsedLine.images || [],
-    })
-    outLines.push(lineText)
-    offset += lineText.length + 1
-  }
-
-  return {
-    text: outLines.join('\n'),
-    lines,
-  }
-}
-
-function shiftStyles_(styles, offset) {
-  const delta = Number(offset) || 0
-  if (!styles || styles.length === 0 || delta === 0) return styles || []
-  const out = []
-  for (let i = 0; i < styles.length; i++) {
-    const s = styles[i]
-    const next = {}
-    for (const key in s) next[key] = s[key]
-    next.start = (Number(s.start) || 0) + delta
-    out.push(next)
-  }
-  return out
-}
-
-function extractAlignmentFromContent_(content) {
-  const m = /^\{align:(left|center|middle|right|justify)\}/i.exec(String(content || ''))
-  if (!m) return { alignment: null, content: String(content || '') }
-  const raw = m[1].toLowerCase()
-  return { alignment: raw === 'middle' ? 'center' : raw, content: String(content || '').substring(m[0].length) }
-}
-
-function parseMarkdownLineForDocsApi_(line) {
-  const headingInfo = parseHeadingFromLine_(line)
-  if (headingInfo) {
-    const alignInfo = extractAlignmentFromContent_(headingInfo.content)
-    const inline = parseInlineMarkdownForDocsApi_(alignInfo.content)
-    return {
-      text: inline.text,
-      styles: inline.styles,
-      images: inline.images || [],
-      headingLevel: headingInfo.level,
-      isList: false,
-      listType: null,
-      alignment: alignInfo.alignment,
-    }
-  }
-
-  const unorderedMatch = /^\s*[-*+]\s+(.*)$/.exec(line)
-  if (unorderedMatch) {
-    const detailed = /^([ \t]*)[-*+]\s+(.*)$/.exec(line)
-    const leading = detailed ? detailed[1] : ''
-    const rawContent = detailed ? detailed[2] : unorderedMatch[1]
-    const alignInfo = extractAlignmentFromContent_(rawContent)
-    const content = normalizeListMarkdownContent_(alignInfo.content)
-    const inline = parseInlineMarkdownForDocsApi_(content)
-    return {
-      text: inline.text,
-      styles: inline.styles,
-      images: inline.images || [],
-      headingLevel: 0,
-      isList: true,
-      listType: 'unordered',
-      nestingLevel: listNestingLevelFromLeading_(leading),
-      alignment: alignInfo.alignment,
-    }
-  }
-
-  const orderedMatch = /^\s*\d+\.\s+(.*)$/.exec(line)
-  if (orderedMatch) {
-    const detailed = /^([ \t]*)\d+\.\s+(.*)$/.exec(line)
-    const leading = detailed ? detailed[1] : ''
-    const rawContent = detailed ? detailed[2] : orderedMatch[1]
-    const alignInfo = extractAlignmentFromContent_(rawContent)
-    const content = normalizeListMarkdownContent_(alignInfo.content)
-    const inline = parseInlineMarkdownForDocsApi_(content)
-    return {
-      text: inline.text,
-      styles: inline.styles,
-      images: inline.images || [],
-      headingLevel: 0,
-      isList: true,
-      listType: 'ordered',
-      nestingLevel: listNestingLevelFromLeading_(leading),
-      alignment: alignInfo.alignment,
-    }
-  }
-
-  const alignInfo = extractAlignmentFromContent_(line)
-  const inline = parseInlineMarkdownForDocsApi_(alignInfo.content)
-  return {
-    text: inline.text,
-    styles: inline.styles,
-    images: inline.images || [],
-    headingLevel: 0,
-    isList: false,
-    listType: null,
-    nestingLevel: 0,
-    alignment: alignInfo.alignment,
-  }
-}
-
-function parseHeadingFromLine_(line) {
-  const text = String(line || '')
-
-  const plain = /^\s{0,3}(#{1,4})\s+(.*)$/.exec(text)
-  if (plain) {
-    return {
-      level: plain[1].length,
-      content: plain[2],
-    }
-  }
-
-  const escaped = /^\s{0,3}((?:\\#){1,4})\s+(.*)$/.exec(text)
-  if (escaped) {
-    const level = (escaped[1].match(/\\#/g) || []).length
-    return {
-      level: Math.max(1, Math.min(4, level)),
-      content: escaped[2],
-    }
-  }
-
-  return null
-}
-
-function normalizeListMarkdownContent_(content) {
-  let text = String(content || '')
-  let prev
-  do {
-    prev = text
-    text = text.replace(/^\s*\\[*+-]\s+/, '')
-    text = text.replace(/^\s*\\\d+\.\s+/, '')
-    text = text.replace(/^\s*(?:\\#){1,4}\s+/, '')
-    text = text.replace(/^\s*#{1,4}\s+/, '')
-  } while (text !== prev)
-  return text
-}
-
-function listNestingLevelFromLeading_(leading) {
-  const text = String(leading || '')
-  let level = 0
-  let spaces = 0
-  for (let i = 0; i < text.length; i++) {
-    const ch = text.charAt(i)
-    if (ch === '\t') {
-      level += 1
-      spaces = 0
-      continue
-    }
-    if (ch === ' ') {
-      spaces += 1
-      if (spaces >= 2) {
-        level += 1
-        spaces = 0
-      }
-    }
-  }
-  return level
-}
-
-function parseInlineMarkdownForDocsApi_(content) {
-  let i = 0
-  let plain = ''
-  let bold = false
-  let italic = false
-  let underline = false
-  let color = null
-  let size = null
-  let highlight = null
-  let runStart = 0
-  const styles = []
-  const images = []
-
-  function pushStyleSegment(endExclusive) {
-    const length = endExclusive - runStart
-    if (length <= 0) return
-    if (!bold && !italic && !underline && !color && !size && !highlight) return
-    const span = { start: runStart, length, bold, italic, underline }
-    if (color) span.foregroundColor = color
-    if (size) span.fontSize = size
-    if (highlight) span.backgroundColor = highlight
-    styles.push(span)
-  }
-
-  while (i < content.length) {
-    // Image: {img:ID} or {img:ID src="url"}
-    if (content.startsWith('{img:', i)) {
-      const tagEnd = content.indexOf('}', i + 5)
-      if (tagEnd !== -1) {
-        pushStyleSegment(plain.length)
-        runStart = plain.length
-        const tagInner = content.substring(i + 5, tagEnd)
-        const srcMatch = /\ssrc="([^"]*)"/.exec(tagInner)
-        const id = srcMatch ? tagInner.substring(0, tagInner.indexOf(' ')) : tagInner
-        const url = srcMatch ? srcMatch[1] : ''
-        images.push({ offset: plain.length, id, url })
-        i = tagEnd + 1
-        continue
-      }
-    }
-
-    // Legacy image: ![alt](url)
-    if (content.charAt(i) === '!' && content.charAt(i + 1) === '[') {
-      const altClose = content.indexOf(']', i + 2)
-      if (altClose !== -1 && content.charAt(altClose + 1) === '(') {
-        const urlClose = content.indexOf(')', altClose + 2)
-        if (urlClose !== -1) {
-          pushStyleSegment(plain.length)
-          runStart = plain.length
-          const alt = content.substring(i + 2, altClose)
-          const url = content.substring(altClose + 2, urlClose)
-          images.push({ offset: plain.length, id: null, url, alt })
-          i = urlClose + 1
-          continue
-        }
-      }
-    }
-
-    if (content.startsWith('{/u}', i)) {
-      pushStyleSegment(plain.length)
-      runStart = plain.length
-      underline = false
-      i += 4
-      continue
-    }
-
-    if (content.startsWith('{u}', i)) {
-      pushStyleSegment(plain.length)
-      runStart = plain.length
-      underline = true
-      i += 3
-      continue
-    }
-
-    if (content.startsWith('{/color}', i)) {
-      pushStyleSegment(plain.length)
-      runStart = plain.length
-      color = null
-      i += 8
-      continue
-    }
-
-    if (content.startsWith('{/size}', i)) {
-      pushStyleSegment(plain.length)
-      runStart = plain.length
-      size = null
-      i += 7
-      continue
-    }
-
-    if (content.startsWith('{/highlight}', i)) {
-      pushStyleSegment(plain.length)
-      runStart = plain.length
-      highlight = null
-      i += 12
-      continue
-    }
-
-    const colorOpen = /^\{color:\s*(#[0-9a-fA-F]{6})\}/.exec(content.substring(i))
-    if (colorOpen) {
-      pushStyleSegment(plain.length)
-      runStart = plain.length
-      color = colorOpen[1].toLowerCase()
-      i += colorOpen[0].length
-      continue
-    }
-
-    const sizeOpen = /^\{size:\s*(\d{1,3})\}/.exec(content.substring(i))
-    if (sizeOpen) {
-      pushStyleSegment(plain.length)
-      runStart = plain.length
-      size = Math.max(1, Math.min(200, Number(sizeOpen[1]) || 11))
-      i += sizeOpen[0].length
-      continue
-    }
-
-    const highlightOpen = /^\{highlight:\s*(#[0-9a-fA-F]{6})\}/.exec(content.substring(i))
-    if (highlightOpen) {
-      pushStyleSegment(plain.length)
-      runStart = plain.length
-      highlight = highlightOpen[1].toLowerCase()
-      i += highlightOpen[0].length
-      continue
-    }
-
-    const ch = content.charAt(i)
-    const next = content.charAt(i + 1)
-
-    if (
-      ch === '\\' &&
-      (next === '*' ||
-        next === '\\' ||
-        next === '{' ||
-        next === '}' ||
-        next === '#' ||
-        next === '+' ||
-        next === '-' ||
-        next === '.' ||
-        next === '[' ||
-        next === ']' ||
-        next === '(' ||
-        next === ')' ||
-        next === '_' ||
-        next === '`')
-    ) {
-      plain += next
-      i += 2
-      continue
-    }
-
-    if (ch === '*' && next === '*') {
-      pushStyleSegment(plain.length)
-      runStart = plain.length
-      bold = !bold
-      i += 2
-      continue
-    }
-
-    if (ch === '*') {
-      pushStyleSegment(plain.length)
-      runStart = plain.length
-      italic = !italic
-      i += 1
-      continue
-    }
-
-    plain += ch
-    i += 1
-  }
-
-  pushStyleSegment(plain.length)
-  return { text: plain, styles, images }
 }
 
 function hexToRgbColor_(hex) {
@@ -2243,24 +1072,6 @@ function hexToRgbColor_(hex) {
   }
 }
 
-function docsApiAlignmentFromString_(alignment) {
-  const a = String(alignment || '').toLowerCase()
-  if (a === 'center' || a === 'middle') return 'CENTER'
-  if (a === 'right') return 'RIGHT'
-  if (a === 'justify') return 'JUSTIFIED'
-  if (a === 'left') return 'START'
-  return null
-}
-
-function documentAppAlignmentFromString_(alignment) {
-  const a = String(alignment || '').toLowerCase()
-  if (a === 'center' || a === 'middle') return DocumentApp.HorizontalAlignment.CENTER
-  if (a === 'right') return DocumentApp.HorizontalAlignment.RIGHT
-  if (a === 'justify') return DocumentApp.HorizontalAlignment.JUSTIFY
-  if (a === 'left') return DocumentApp.HorizontalAlignment.LEFT
-  return null
-}
-
 // Resolves the URL for an image token. If the token has a url, returns it directly.
 // If only an id is provided, looks up the contentUri from inlineObjects.
 function resolveImageUrl_(img, inlineObjects) {
@@ -2271,7 +1082,8 @@ function resolveImageUrl_(img, inlineObjects) {
   return (embedded && embedded.imageProperties && embedded.imageProperties.contentUri) || ''
 }
 
-// For each image insert that has a googleusercontent URL, fetches the image blob,// uploads it as a temporary Drive file (set to public read), and replaces the URL
+// For each image insert that has a googleusercontent URL, fetches the image blob,
+// uploads it as a temporary Drive file (set to public read), and replaces the URL
 // with the public Drive download URL. Returns an array of temp Drive file IDs for
 // cleanup via cleanupTempImageFiles_.
 function resolveImageUrisToPublic_(imageInserts) {
@@ -2296,29 +1108,6 @@ function resolveImageUrisToPublic_(imageInserts) {
 function cleanupTempImageFiles_(tempFileIds) {
   for (let i = 0; i < tempFileIds.length; i++) {
     try { DriveApp.getFileById(tempFileIds[i]).setTrashed(true) } catch (e) {}
-  }
-}
-
-function clearDocumentViaDocsApi_(documentId, tabContext) {
-  const context = tabContext || resolveDocTabContext_(docsApiGetDocument_(documentId, true))
-  const content = context.content || []
-  const last = content.length > 0 ? content[content.length - 1] : null
-  const endIndex = last && last.endIndex ? last.endIndex : 1
-
-  if (endIndex > 2) {
-    const range = {
-      startIndex: 1,
-      endIndex: endIndex - 1,
-    }
-    if (context.requestTabId) range.tabId = context.requestTabId
-
-    docsApiBatchUpdate_(documentId, [
-      {
-        deleteContentRange: {
-          range,
-        },
-      },
-    ])
   }
 }
 
@@ -2444,40 +1233,6 @@ function normalizeDriveQuery_(params) {
   return `title contains "${escaped}" and trashed = false`
 }
 
-function applyPatch(doctext, patch, dmp) {
-  let text = doctext.getText()
-  let patches = dmp.patch_fromText(patch)
-  let [text2, results] = dmp.patch_apply(patches, text)
-
-  // Apply minimal text edits so untouched ranges keep their original styles.
-  let diffs = dmp.diff_main(text, text2, false)
-  applyDiffsPreservingStyles(doctext, diffs)
-
-  return [text2, patches, results]
-}
-
-function applyUnifiedPatch(doctext, patchText, dmp) {
-  const text = doctext.getText()
-  const hunks = parseUnifiedHunks_(patchText)
-  const [targetText, results] = applyUnifiedHunksToText_(text, hunks)
-  const dmpApplied = applyTextTransitionWithDmpToDocument_(doctext, text, targetText, dmp)
-
-  return [dmpApplied.text, hunks, results, dmpApplied.results]
-}
-
-function applyTextTransitionWithDmpString_(fromText, toText, dmp) {
-  const patches = dmp.patch_make(fromText, toText)
-  const applied = dmp.patch_apply(patches, fromText)
-  return { text: applied[0], results: applied[1] }
-}
-
-function applyTextTransitionWithDmpToDocument_(doctext, fromText, toText, dmp) {
-  const applied = applyTextTransitionWithDmpString_(fromText, toText, dmp)
-  const diffs = dmp.diff_main(fromText, applied.text, false)
-  applyDiffsPreservingStyles(doctext, diffs)
-  return applied
-}
-
 function parseUnifiedHunks_(patchText) {
   const lines = String(patchText).split(/\r?\n/)
   const hunks = []
@@ -2500,6 +1255,10 @@ function parseUnifiedHunks_(patchText) {
     const hunkLines = []
     while (i < lines.length && !lines[i].startsWith('@@ ')) {
       const line = lines[i]
+      if (line.length === 0) {
+        i++
+        continue
+      }
       const tag = line.charAt(0)
       if (tag === ' ' || tag === '+' || tag === '-') {
         const encoded = line.substring(1)
@@ -2573,47 +1332,4 @@ function findNearbyMatch_(allLines, seq, hintIndex, windowSize) {
     if (linesMatchAt_(allLines, i, seq)) return i
   }
   return -1
-}
-
-function applyDiffsPreservingStyles(doctext, diffs) {
-  let index = 0
-  let ops = []
-
-  for (let i = 0; i < diffs.length; i++) {
-    let diff = diffs[i]
-    let op = diff[0]
-    let chunk = diff[1]
-    if (!chunk) continue
-
-    if (op === DIFF_EQUAL) {
-      index += chunk.length
-    } else if (op === DIFF_DELETE) {
-      ops.push({ type: 'delete', start: index, end: index + chunk.length - 1 })
-      index += chunk.length
-    } else if (op === DIFF_INSERT) {
-      ops.push({ type: 'insert', start: index, text: chunk })
-    }
-  }
-
-  for (let i = ops.length - 1; i >= 0; i--) {
-    let op = ops[i]
-
-    if (op.type === 'delete') {
-      doctext.deleteText(op.start, op.end)
-      continue
-    }
-
-    let attrs = getInsertAttributes(doctext, op.start)
-    doctext.insertText(op.start, op.text)
-    if (attrs) {
-      doctext.setAttributes(op.start, op.start + op.text.length - 1, attrs)
-    }
-  }
-}
-
-function getInsertAttributes(doctext, insertionIndex) {
-  let length = doctext.getText().length
-  if (length === 0) return null
-  if (insertionIndex > 0) return doctext.getAttributes(insertionIndex - 1)
-  return doctext.getAttributes(0)
 }

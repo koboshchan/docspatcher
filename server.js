@@ -113,7 +113,7 @@ mcpServer.tool(
 
 mcpServer.tool(
   'getcontents',
-  'Read document content by file `id` in the custom markdown format only. Supports chunked reads with optional 1-based `startLine` and `endLine`, and optional `tabId` (defaults to document body). Returns document metadata including `title`, `lastEditedMs`, `lastEditedIso`, and `availableTabs` (tab id/title/index list). Headings are supported from `#` to `####`. Inline styles may include `**bold**`, `*italic*`, `{u}...{/u}`, `{color:#rrggbb}...{/color}`, and `{size:N}...{/size}` (font size in points). List nesting is exported with leading tabs; unordered list items use `* ` and ordered list items use `N. `. Inline images are exported as `{img:OBJECT_ID src="url"}` where url is a time-limited Google content URI (~30 min). The OBJECT_ID is stable for the lifetime of the image in the document.',
+  'Read document content by file `id` in a tokenized linear text format. Supports chunked reads with optional 1-based `startLine` and `endLine`, and optional `tabId` (defaults to document body). Returns document metadata including `title`, `lastEditedMs`, `lastEditedIso`, and `availableTabs` (tab id/title/index list). The output contains immutable structural elements inside \\uFFFC[...] token parameters (e.g. \\uFFFC[table:block_index] or \\uFFFC[image:objectId]). Paragraphs contain headings (e.g. #) and lists (nested with tabs, prefix * or N.).',
   {
     id: z.string().min(1),
     startLine: z.number().int().min(1).optional(),
@@ -144,7 +144,7 @@ mcpServer.tool(
 
 mcpServer.tool(
   'applypatch',
-  'Apply a patch to a Google Doc using the custom markdown format only. Args: `id`, `patch`, optional `algorithm` (`unified` default or `dmp`), optional `tabId` (defaults to document body). Unified syntax uses hunks like `@@ -oldStart,oldCount +newStart,newCount @@` with context lines prefixed by space, removals with `-`, and additions with `+`. Headings are supported from `#` to `####`. Supported inline style tags are `**bold**`, `*italic*`, `{u}...{/u}`, `{color:#rrggbb}...{/color}`, and `{size:N}...{/size}` (font size in points). For lists, use leading tabs for nesting, `* ` or `- ` for unordered items, and `N. ` for ordered items. Images use `{img:OBJECT_ID}` — the ID alone is sufficient; the src URL is looked up automatically from the document. Optionally include `src` to override: `{img:OBJECT_ID src="url"}`. Images with googleusercontent src are fetched and reinserted within the ~30 min content URI window. To insert a brand-new image use `{img:new src="https://any-accessible-url"}`.',
+  'Apply a patch to a Google Doc using the tokenized linear text format. Args: `id`, `patch`, optional `algorithm` (`unified` default or `dmp`), optional `tabId` (defaults to document body). Unified syntax uses hunks like @@ -oldStart,oldCount +newStart,newCount @@ with context lines prefixed by space, removals with - and additions with +.',
   {
     id: z.string().min(1),
     patch: z.string().min(1),
@@ -157,6 +157,26 @@ mcpServer.tool(
     return {
       content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
     }
+  }
+)
+
+mcpServer.tool(
+  'apply_structural_edits',
+  'Apply safe, non-destructive text changes to a document tab using direct index tracking components.',
+  {
+    id: z.string().min(1),
+    tabId: z.string().min(1),
+    operations: z.array(z.object({
+      type: z.enum(['retain', 'insert', 'delete']),
+      text: z.string().optional(),  // Required for text insertions
+      count: z.number().int().positive().optional() // Required for retains and deletions
+    }))
+  },
+  async ({ id, tabId, operations }) => {
+    const result = await bridge.call('execute_ot_patch', { id, tabId, operations });
+    return {
+      content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
+    };
   }
 )
 
