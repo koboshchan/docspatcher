@@ -262,6 +262,20 @@ function buildBridgeHtml_(wsUrl, token) {
             return
           }
 
+          if (msg.method === 'makecopy') {
+            google.script.run
+              .withSuccessHandler((result) => {
+                logLine('makecopy success')
+                sendResult(id, result)
+              })
+              .withFailureHandler((err) => {
+                logLine('makecopy failure')
+                sendError(id, err && err.message)
+              })
+              .mcp_makeCopy(params.id, params.title)
+            return
+          }
+
           sendError(id, 'Unknown method: ' + msg.method)
         })
       })()
@@ -304,6 +318,10 @@ function mcp_applyPatch(id, patchText, algorithm, format, tabId) {
 
 function mcp_executeOtPatch(id, tabId, operations) {
   return executeOtPatch(id, tabId, operations)
+}
+
+function mcp_makeCopy(id, title) {
+  return makeCopy(id, title)
 }
 
 function getContents(id, startLine, endLine, format, tabId) {
@@ -438,6 +456,24 @@ function newDoc(title) {
     lastEditedIso: updated.toISOString(),
   }
 }
+
+function makeCopy(id, title) {
+  const file = DriveApp.getFileById(id)
+  let name = String(title || '').trim()
+  if (!name) {
+    name = 'Copy of ' + file.getName()
+  }
+  const copiedFile = file.makeCopy(name)
+  const updated = copiedFile.getLastUpdated()
+  return {
+    id: copiedFile.getId(),
+    title: copiedFile.getName(),
+    url: copiedFile.getUrl(),
+    lastEditedMs: updated.getTime(),
+    lastEditedIso: updated.toISOString(),
+  }
+}
+
 
 function newTab(id, title, parentTabId) {
   const nextTitle = String(title || '').trim()

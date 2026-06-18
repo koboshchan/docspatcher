@@ -95,6 +95,23 @@ mcpServer.tool(
 )
 
 mcpServer.tool(
+  'makecopy',
+  'Make a copy of an existing Google Doc. Args: `id` (source document ID), optional `title` (title of the copied document).',
+  {
+    id: z.string().min(1),
+    title: z.string().min(1).optional(),
+  },
+  async ({ id, title }) => {
+    const result = await bridge.call('makecopy', { id, title })
+    return {
+      content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+      structuredContent: result,
+    }
+  }
+)
+
+
+mcpServer.tool(
   'newtab',
   'Create a new tab in a Google Doc. Args: `id` (doc id), `title` (tab title), optional `parentTabId` for nesting.',
   {
