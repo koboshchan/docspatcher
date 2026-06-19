@@ -1,6 +1,6 @@
 import { getOrRefreshToken, invalidateToken } from './token-manager.js';
 import { FileMetadata } from './types.js';
-import { resolveImageUrl, parseStyleTagsAndPrefixes, namedStyleTypeFromHeadingLevel, hexToRgbColor, resolveDocTabContext } from './patch-engine.js';
+import { resolveImageUrl, parseStyleTagsAndPrefixes, namedStyleTypeFromHeadingLevel, hexToRgbColor, resolveDocTabContext, isEmptyParagraph } from './patch-engine.js';
 
 async function makeRestRequest(method: string, url: string, body?: any, retried = false): Promise<any> {
   const token = await getOrRefreshToken();
@@ -577,6 +577,18 @@ export async function syncDocumentStyles(
   let blockIdx = 0;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+    
+    // Skip any empty paragraph that immediately precedes a table in rawDocBlocks,
+    // because we skipped exporting it!
+    while (
+      blockIdx < rawDocBlocks.length - 1 &&
+      rawDocBlocks[blockIdx].paragraph &&
+      isEmptyParagraph(rawDocBlocks[blockIdx].paragraph) &&
+      rawDocBlocks[blockIdx + 1].table
+    ) {
+      blockIdx++;
+    }
+
     if (blockIdx >= rawDocBlocks.length) break;
 
     const block = rawDocBlocks[blockIdx];
@@ -781,5 +793,102 @@ function findTabById(tabs: any[], tabId: string): any {
     if (nested) return nested;
   }
   return null;
+}
+
+/**
+ * Fill specific cells in an existing table in a Google Doc using raw batchUpdate.
+ *
+ * @param documentId  - The document ID
+ * @param tabId       - Tab ID (e.g. 't.0') or null for document body
+ * @param tableIndex  - 0-based index of the table within the tab content (i.e., the Nth table)
+ * @param cellFills   - Array of { row, col, text, colorHex? } to fill
+ */
+export async function fillTableCells(
+  documentId: string,
+  tabId: string | null,
+  tableIndex: number,
+  cellFills: Array<{ row: number; col: number; text: string; colorHex?: string }>
+): Promise<number> {
+  const doc = await docsApiGetDocument(documentId, true);
+  const tabContext = resolveDocTabContext(doc, tabId);
+  const content = tabContext.content || [];
+  const tables = content.filter((block: any) => block.table);
+
+  if (tableIndex >= tables.length) {
+    throw new Error(`Table index ${tableIndex} out of range (found ${tables.length} tables)`);
+  }
+
+  const table = tables[tableIndex];
+  const rows = table.table.tableRows || [];
+  const requests: any[] = [];
+
+  for (const fill of cellFills) {
+    const { row, col, text, colorHex } = fill;
+    const tableRow = rows[row];
+    if (!tableRow) { console.warn(`Row ${row} not found in table`); continue; }
+    const cells = tableRow.tableCells || [];
+    const cell = cells[col];
+    if (!cell) { console.warn(`Col ${col} not found in row ${row}`); continue; }
+
+    const cellStartIndex = Number(cell.startIndex);
+
+    // Check if cell already has non-empty content
+    const existingContent = (cell.content || []);
+    let existingText = '';
+    for (const elem of existingContent) {
+      for (const pe of (elem.paragraph?.elements || [])) {
+        existingText += pe.textRun?.content || '';
+      }
+    }
+    const plainExisting = existingText.replace(/\n/g, '').trim();
+
+    if (plainExisting.length > 0) {
+      console.log(`  Cell [${row}][${col}] already has content, skipping`);
+      continue;
+    }
+
+    // Insert text at cellStartIndex + 1
+    const insertIndex = cellStartIndex + 1;
+    const location: any = { index: insertIndex };
+    if (tabId) location.tabId = tabId;
+
+    requests.push({
+      insertText: { location, text }
+    });
+
+    // Apply color styling if requested
+    if (colorHex) {
+      const rgb = hexToRgbColor(colorHex);
+      if (rgb) {
+        const range: any = { startIndex: insertIndex, endIndex: insertIndex + text.length };
+        if (tabId) range.tabId = tabId;
+        requests.push({
+          updateTextStyle: {
+            textStyle: {
+              foregroundColor: { color: { rgbColor: rgb } },
+              fontSize: { magnitude: 11, unit: 'PT' }
+            },
+            fields: 'foregroundColor,fontSize',
+            range
+          }
+        });
+      }
+    }
+  }
+
+  if (requests.length === 0) {
+    console.log('  No cells to fill');
+    return 0;
+  }
+
+  // Sort insert requests descending by index so later inserts don't shift earlier ones
+  requests.sort((a, b) => {
+    const aIdx = a.insertText?.location?.index ?? a.updateTextStyle?.range?.startIndex ?? 0;
+    const bIdx = b.insertText?.location?.index ?? b.updateTextStyle?.range?.startIndex ?? 0;
+    return bIdx - aIdx;
+  });
+
+  await docsApiBatchUpdate(documentId, requests);
+  return requests.length;
 }
 

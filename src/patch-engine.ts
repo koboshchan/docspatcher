@@ -83,18 +83,12 @@ export function markdownListPrefixFromParagraph(
 ): string {
   if (!paragraph || !paragraph.bullet) return '';
 
-  const listId = paragraph.bullet.listId || 'default';
   const level = Math.max(0, Number(paragraph.bullet.nestingLevel) || 0);
   const indent = '\t'.repeat(level);
   const ordered = isOrderedListParagraph(paragraph, listsById);
 
-  if (!ordered) return indent + '* ';
-
-  const key = listId + ':' + level;
-  const current = Number(listState && listState.counters && listState.counters[key]) || 0;
-  const next = current + 1;
-  if (listState && listState.counters) listState.counters[key] = next;
-  return indent + next + '. ';
+  if (!ordered) return indent + '{{list:bullet}}';
+  return indent + '{{list:ordered}}';
 }
 
 export function isOrderedListParagraph(paragraph: any, listsById: any): boolean {
@@ -751,13 +745,13 @@ export function parseStyleTagsAndPrefixes(inputText: string, keepTabs = false): 
     prefixLen: 0
   };
 
-  const listRegex = /^(\t*)(?:(\*\s)|(\d+\.\s))/;
+  const listRegex = /^(\t*)\{\{list:(bullet|ordered)\}\}/;
   const listMatch = listRegex.exec(text);
   if (listMatch) {
     listInfo.nestingLevel = listMatch[1].length;
-    if (listMatch[2]) {
+    if (listMatch[2] === 'bullet') {
       listInfo.listType = 'bullet';
-    } else if (listMatch[3]) {
+    } else if (listMatch[2] === 'ordered') {
       listInfo.listType = 'ordered';
     }
     listInfo.prefixLen = listMatch[0].length;

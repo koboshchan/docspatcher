@@ -411,6 +411,32 @@ mcpServer.tool(
   }
 );
 
+mcpServer.tool(
+  'fill_table_cells',
+  'Fill specific cells in an existing table in a Google Doc using raw batchUpdate. Args: `id` (document ID), `tabId` (optional tab ID, e.g. "t.0"), `tableIndex` (0-based index of which table in the doc), `cells` (array of {row, col, text, colorHex?} objects).',
+  {
+    id: z.string().min(1),
+    tabId: z.string().min(1).optional(),
+    tableIndex: z.number().int().min(0).default(0),
+    cells: z.array(
+      z.object({
+        row: z.number().int().min(0),
+        col: z.number().int().min(0),
+        text: z.string(),
+        colorHex: z.string().optional(),
+      })
+    ),
+  },
+  async ({ id, tabId, tableIndex, cells }) => {
+    const count = await googleApi.fillTableCells(id, tabId || null, tableIndex, cells);
+    const result = { success: true, updatedCount: count };
+    return {
+      content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+      structuredContent: result,
+    };
+  }
+);
+
 // Start HTTP server
 const server = http.createServer(app);
 
