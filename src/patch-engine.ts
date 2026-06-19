@@ -11,12 +11,53 @@ export function normalizeContentFormat(format?: string): 'markdown' {
   return 'markdown';
 }
 
-export function getDocsParagraphText(paragraph: any): string {
-  const elements = (paragraph && paragraph.elements) || [];
-  return elements
-    .map((e: any) => (e.textRun && e.textRun.content) || '')
-    .join('')
-    .replace(/\n$/, '');
+export function getHexFromRgb(rgb: any): string {
+  if (!rgb) return 'default';
+  const red = Math.round((rgb.red || 0) * 255);
+  const green = Math.round((rgb.green || 0) * 255);
+  const blue = Math.round((rgb.blue || 0) * 255);
+  return '#' + [red, green, blue]
+    .map(x => x.toString(16).padStart(2, '0').toUpperCase())
+    .join('');
+}
+
+export function extractHexColor(textStyle: any): string {
+  const fg = textStyle?.foregroundColor;
+  const rgb = fg?.color?.rgbColor;
+  if (rgb) {
+    return getHexFromRgb(rgb);
+  }
+  return 'default';
+}
+
+export function extractFontSize(textStyle: any): number | 'default' {
+  const fs = textStyle?.fontSize;
+  if (fs) {
+    if (typeof fs.magnitude === 'number') {
+      return fs.magnitude;
+    }
+    if (typeof fs.size === 'number') {
+      return fs.size;
+    }
+  }
+  return 'default';
+}
+
+export function headingLevelFromNamedStyleType(namedStyleType?: string): number {
+  const type = String(namedStyleType || '');
+  if (type === 'TITLE') return 1;
+  if (type === 'SUBTITLE') return 2;
+
+  const m = /^HEADING_(\d)$/.exec(type);
+  if (!m) return 0;
+  return Math.max(1, Math.min(4, Number(m[1]) || 1));
+}
+
+export function namedStyleTypeFromHeadingLevel(headingLevel: number): string {
+  const lvl = Number(headingLevel);
+  if (lvl === 0) return 'NORMAL_TEXT';
+  const level = Math.max(1, Math.min(4, lvl || 1));
+  return 'HEADING_' + level;
 }
 
 export function markdownHeadingPrefixFromParagraph(paragraph: any): string {
@@ -33,21 +74,6 @@ export function markdownAlignmentPrefixFromParagraph(paragraph: any): string {
   if (alignment === 'RIGHT') return '{align:right}';
   if (alignment === 'JUSTIFIED') return '{align:justify}';
   return '';
-}
-
-export function headingLevelFromNamedStyleType(namedStyleType?: string): number {
-  const type = String(namedStyleType || '');
-  if (type === 'TITLE') return 1;
-  if (type === 'SUBTITLE') return 2;
-
-  const m = /^HEADING_(\d)$/.exec(type);
-  if (!m) return 0;
-  return Math.max(1, Math.min(4, Number(m[1]) || 1));
-}
-
-export function namedStyleTypeFromHeadingLevel(headingLevel: number): string {
-  const level = Math.max(1, Math.min(4, Number(headingLevel) || 1));
-  return 'HEADING_' + level;
 }
 
 export function markdownListPrefixFromParagraph(
@@ -85,6 +111,22 @@ export function isOrderedListParagraph(paragraph: any, listsById: any): boolean 
   const glyphType = String(nesting && nesting.glyphType ? nesting.glyphType : '');
 
   return /DECIMAL|ALPHA|ROMAN|NUMBER/i.test(glyphType);
+}
+
+export function isEmptyParagraph(paragraph: any): boolean {
+  if (!paragraph) return true;
+  if (paragraph.bullet) return false;
+  const elements = paragraph.elements || [];
+  if (elements.length === 0) return true;
+  if (elements.length > 1) return false;
+  const el = elements[0];
+  if (!el) return true;
+  if (el.inlineObjectElement) return false;
+  if (el.textRun) {
+    const content = el.textRun.content || '';
+    return content === '\n' || content === '';
+  }
+  return true;
 }
 
 export function docsApiAlignmentFromString(alignment?: string): string | null {
@@ -198,6 +240,117 @@ export function findTabById(tabs: any[], tabId: string): any {
   return null;
 }
 
+export function linearizeParagraphToText(
+  paragraph: any,
+  listsById: any,
+  listState: { counters: Record<string, number> }
+): string {
+  let paraLinearText = '';
+
+  const style = paragraph.paragraphStyle;
+  const align = style?.alignment;
+  let alignTag = '';
+  if (align === 'CENTER') alignTag = '{{align:center}}';
+  else if (align === 'RIGHT') alignTag = '{{align:right}}';
+  else if (align === 'JUSTIFIED') alignTag = '{{align:justify}}';
+  else if (align === 'START') alignTag = '{{align:left}}';
+
+  const level = headingLevelFromNamedStyleType(style?.namedStyleType);
+  let headingTag = '';
+  if (level > 0) {
+    headingTag = `{{heading:${level}}}`;
+  } else if (style?.namedStyleType === 'NORMAL_TEXT') {
+    headingTag = `{{heading:0}}`;
+  }
+
+  paraLinearText += alignTag + headingTag;
+
+  const listPrefix = markdownListPrefixFromParagraph(paragraph, listsById, listState);
+  paraLinearText += listPrefix;
+
+  let activeStyle = {
+    bold: false,
+    italic: false,
+    underline: false,
+    strikethrough: false,
+    color: 'default',
+    fontSize: 'default' as number | 'default'
+  };
+
+  const elements = paragraph.elements || [];
+  for (let j = 0; j < elements.length; j++) {
+    const el = elements[j];
+    if (!el) continue;
+
+    if (el.inlineObjectElement) {
+      const objectId = el.inlineObjectElement.inlineObjectId;
+      paraLinearText += '\uFFFC[image:' + objectId + ']';
+    } else if (el.textRun) {
+      const runStyle = el.textRun.textStyle || {};
+      const bold = !!runStyle.bold;
+      const italic = !!runStyle.italic;
+      const underline = !!runStyle.underline;
+      const strikethrough = !!runStyle.strikethrough;
+      const color = extractHexColor(runStyle);
+      const fontSize = extractFontSize(runStyle);
+
+      let styleTags = '';
+      if (bold !== activeStyle.bold) {
+        styleTags += `{{bold:${bold}}}`;
+        activeStyle.bold = bold;
+      }
+      if (italic !== activeStyle.italic) {
+        styleTags += `{{italic:${italic}}}`;
+        activeStyle.italic = italic;
+      }
+      if (underline !== activeStyle.underline) {
+        styleTags += `{{underline:${underline}}}`;
+        activeStyle.underline = underline;
+      }
+      if (strikethrough !== activeStyle.strikethrough) {
+        styleTags += `{{strikethrough:${strikethrough}}}`;
+        activeStyle.strikethrough = strikethrough;
+      }
+      if (color !== activeStyle.color) {
+        styleTags += `{{color:${color}}}`;
+        activeStyle.color = color;
+      }
+      if (fontSize !== activeStyle.fontSize) {
+        styleTags += `{{fontSize:${fontSize}}}`;
+        activeStyle.fontSize = fontSize;
+      }
+
+      paraLinearText += styleTags;
+
+      const contentText = el.textRun.content || '';
+      const endsWithNL = contentText.endsWith('\n');
+      const runText = endsWithNL ? contentText.slice(0, -1) : contentText;
+      paraLinearText += runText;
+    }
+  }
+
+  if (activeStyle.bold) paraLinearText += '{{bold:false}}';
+  if (activeStyle.italic) paraLinearText += '{{italic:false}}';
+  if (activeStyle.underline) paraLinearText += '{{underline:false}}';
+  if (activeStyle.strikethrough) paraLinearText += '{{strikethrough:false}}';
+  if (activeStyle.color !== 'default') paraLinearText += '{{color:default}}';
+  if (activeStyle.fontSize !== 'default') paraLinearText += '{{fontSize:default}}';
+
+  paraLinearText += '\n';
+  return paraLinearText;
+}
+
+export function linearizeCellContent(content: any[], listsById: any, listState: any): string {
+  let cellText = '';
+  for (let i = 0; i < content.length; i++) {
+    const block = content[i];
+    if (block && block.paragraph) {
+      cellText += linearizeParagraphToText(block.paragraph, listsById, listState);
+    }
+  }
+  return cellText;
+}
+
 export function getLinearTextAndMap(doc: any, tabContext: any): { text: string; elementMap: DocElementMap[] } {
   const content = tabContext.content || [];
   const listsById = tabContext.listsById || {};
@@ -211,6 +364,12 @@ export function getLinearTextAndMap(doc: any, tabContext: any): { text: string; 
     if (!block) continue;
 
     if (block.paragraph) {
+      // Skip empty paragraph immediately preceding a table block
+      const nextBlock = i + 1 < content.length ? content[i + 1] : null;
+      if (nextBlock && nextBlock.table && isEmptyParagraph(block.paragraph)) {
+        continue;
+      }
+
       const paragraph = block.paragraph;
       const docStart = Number(block.startIndex);
       const docEnd = Number(block.endIndex);
@@ -219,15 +378,45 @@ export function getLinearTextAndMap(doc: any, tabContext: any): { text: string; 
       const parts: any[] = [];
       let paraLinearText = '';
 
-      const headingPrefix = markdownHeadingPrefixFromParagraph(paragraph);
-      const listPrefix = markdownListPrefixFromParagraph(paragraph, listsById, listState);
-      const alignPrefix = markdownAlignmentPrefixFromParagraph(paragraph);
-      const prefix = headingPrefix + listPrefix + alignPrefix;
+      // Emit paragraph-level style tags
+      const style = paragraph.paragraphStyle;
+      const align = style?.alignment;
+      let alignTag = '';
+      if (align === 'CENTER') alignTag = '{{align:center}}';
+      else if (align === 'RIGHT') alignTag = '{{align:right}}';
+      else if (align === 'JUSTIFIED') alignTag = '{{align:justify}}';
+      else if (align === 'START') alignTag = '{{align:left}}';
 
-      if (prefix.length > 0) {
-        paraLinearText += prefix;
-        parts.push({ type: 'prefix', linearLen: prefix.length, docLen: 0 });
+      const level = headingLevelFromNamedStyleType(style?.namedStyleType);
+      let headingTag = '';
+      if (level > 0) {
+        headingTag = `{{heading:${level}}}`;
+      } else if (style?.namedStyleType === 'NORMAL_TEXT') {
+        headingTag = `{{heading:0}}`;
       }
+
+      const paraPrefixTags = alignTag + headingTag;
+      if (paraPrefixTags.length > 0) {
+        paraLinearText += paraPrefixTags;
+        parts.push({ type: 'prefix', linearLen: paraPrefixTags.length, docLen: 0 });
+      }
+
+      // Emit list prefix
+      const listPrefix = markdownListPrefixFromParagraph(paragraph, listsById, listState);
+      if (listPrefix.length > 0) {
+        paraLinearText += listPrefix;
+        parts.push({ type: 'prefix', linearLen: listPrefix.length, docLen: 0 });
+      }
+
+      // Track active inline styles
+      let activeStyle = {
+        bold: false,
+        italic: false,
+        underline: false,
+        strikethrough: false,
+        color: 'default',
+        fontSize: 'default' as number | 'default'
+      };
 
       const elements = paragraph.elements || [];
       for (let j = 0; j < elements.length; j++) {
@@ -249,6 +438,45 @@ export function getLinearTextAndMap(doc: any, tabContext: any): { text: string; 
             objectId: objectId,
           });
         } else if (el.textRun) {
+          const runStyle = el.textRun.textStyle || {};
+          const bold = !!runStyle.bold;
+          const italic = !!runStyle.italic;
+          const underline = !!runStyle.underline;
+          const strikethrough = !!runStyle.strikethrough;
+          const color = extractHexColor(runStyle);
+          const fontSize = extractFontSize(runStyle);
+
+          let styleTags = '';
+          if (bold !== activeStyle.bold) {
+            styleTags += `{{bold:${bold}}}`;
+            activeStyle.bold = bold;
+          }
+          if (italic !== activeStyle.italic) {
+            styleTags += `{{italic:${italic}}}`;
+            activeStyle.italic = italic;
+          }
+          if (underline !== activeStyle.underline) {
+            styleTags += `{{underline:${underline}}}`;
+            activeStyle.underline = underline;
+          }
+          if (strikethrough !== activeStyle.strikethrough) {
+            styleTags += `{{strikethrough:${strikethrough}}}`;
+            activeStyle.strikethrough = strikethrough;
+          }
+          if (color !== activeStyle.color) {
+            styleTags += `{{color:${color}}}`;
+            activeStyle.color = color;
+          }
+          if (fontSize !== activeStyle.fontSize) {
+            styleTags += `{{fontSize:${fontSize}}}`;
+            activeStyle.fontSize = fontSize;
+          }
+
+          if (styleTags.length > 0) {
+            paraLinearText += styleTags;
+            parts.push({ type: 'prefix', linearLen: styleTags.length, docLen: 0 });
+          }
+
           const contentText = el.textRun.content || '';
           const endsWithNL = contentText.endsWith('\n');
           const runText = endsWithNL ? contentText.slice(0, -1) : contentText;
@@ -264,6 +492,20 @@ export function getLinearTextAndMap(doc: any, tabContext: any): { text: string; 
         }
       }
 
+      // Reset inline styles at paragraph boundary
+      let resetTags = '';
+      if (activeStyle.bold) resetTags += '{{bold:false}}';
+      if (activeStyle.italic) resetTags += '{{italic:false}}';
+      if (activeStyle.underline) resetTags += '{{underline:false}}';
+      if (activeStyle.strikethrough) resetTags += '{{strikethrough:false}}';
+      if (activeStyle.color !== 'default') resetTags += '{{color:default}}';
+      if (activeStyle.fontSize !== 'default') resetTags += '{{fontSize:default}}';
+
+      if (resetTags.length > 0) {
+        paraLinearText += resetTags;
+        parts.push({ type: 'prefix', linearLen: resetTags.length, docLen: 0 });
+      }
+
       paraLinearText += '\n';
       parts.push({ type: 'terminator', linearLen: 1, docLen: 1 });
 
@@ -271,20 +513,53 @@ export function getLinearTextAndMap(doc: any, tabContext: any): { text: string; 
       const linearEnd = linearText.length;
 
       elementMap.push({
-        type: 'text', // Standard text paragraph type
+        type: 'text',
         linearStart: linearStart,
         linearEnd: linearEnd,
         docStart: docStart,
         docEnd: docEnd,
-        // Save parts internally for offset search
         ...({ parts } as any),
       });
     } else if (block.table) {
       const docStart = Number(block.startIndex);
       const docEnd = Number(block.endIndex);
 
+      const rows = block.table.rows || block.table.tableRows?.length || 0;
+      const cols = block.table.columns || block.table.tableRows?.[0]?.tableCells?.length || 0;
+
+      const backgroundColors: string[][] = [];
+      const cells: string[][] = [];
+
+      const tableRows = block.table.tableRows || [];
+      for (let r = 0; r < tableRows.length; r++) {
+        const row = tableRows[r];
+        const rowBgs: string[] = [];
+        const rowCells: string[] = [];
+        const tableCells = row.tableCells || [];
+        for (let c = 0; c < tableCells.length; c++) {
+          const cell = tableCells[c];
+          const bg = cell.tableCellStyle?.backgroundColor?.color?.rgbColor;
+          const hexBg = bg ? getHexFromRgb(bg) : 'default';
+          rowBgs.push(hexBg);
+
+          const cellContent = cell.content || [];
+          const cellText = linearizeCellContent(cellContent, listsById, listState);
+          rowCells.push(cellText);
+        }
+        backgroundColors.push(rowBgs);
+        cells.push(rowCells);
+      }
+
+      const tableMetadata = {
+        rows,
+        cols,
+        backgroundColors,
+        cells,
+      };
+
       const linearStart = linearText.length;
-      const token = '\uFFFC[table:' + docStart + ']\n';
+      const jsonStr = JSON.stringify(tableMetadata);
+      const token = `{{table:${jsonStr}}}\n`;
       linearText += token;
       const linearEnd = linearText.length;
 
@@ -294,8 +569,11 @@ export function getLinearTextAndMap(doc: any, tabContext: any): { text: string; 
         linearEnd: linearEnd,
         docStart: docStart,
         docEnd: docEnd,
-        ...({ parts: [{ type: 'table', linearLen: token.length, docLen: docEnd - docStart }] } as any),
-      });
+        parts: [
+          { type: 'table', linearLen: token.length - 1, docLen: docEnd - docStart - 1 },
+          { type: 'terminator', linearLen: 1, docLen: 1 }
+        ]
+      } as any);
     }
   }
 
@@ -423,6 +701,143 @@ export function getLinearOpsFromOt(operations: OtOperation[]): LinearOperation[]
   return ops;
 }
 
+export interface StyleRange {
+  styleName: string;
+  value: any;
+  startIndex: number;
+  endIndex: number;
+}
+
+export function parseStyleTagsAndPrefixes(inputText: string, keepTabs = false): {
+  plainText: string;
+  styles: StyleRange[];
+  listInfo: {
+    listType: 'bullet' | 'ordered' | null;
+    nestingLevel: number;
+    prefixLen: number;
+  };
+  paragraphStyles: {
+    align?: 'START' | 'CENTER' | 'RIGHT' | 'JUSTIFIED';
+    heading?: number;
+  };
+} {
+  let text = inputText;
+
+  // 1. Parse paragraph style tags at the start of the text
+  const paragraphStyles: {
+    align?: 'START' | 'CENTER' | 'RIGHT' | 'JUSTIFIED';
+    heading?: number;
+  } = {};
+
+  const paraTagRegex = /^\{\{align:(center|right|justify|left)\}\}|^\{\{heading:([0-4])\}\}/;
+  let match;
+  while ((match = paraTagRegex.exec(text)) !== null) {
+    if (match[1]) {
+      const a = match[1];
+      if (a === 'center') paragraphStyles.align = 'CENTER';
+      else if (a === 'right') paragraphStyles.align = 'RIGHT';
+      else if (a === 'justify') paragraphStyles.align = 'JUSTIFIED';
+      else if (a === 'left') paragraphStyles.align = 'START';
+    } else if (match[2]) {
+      paragraphStyles.heading = Number(match[2]);
+    }
+    text = text.substring(match[0].length);
+  }
+
+  // 2. Parse list prefix
+  const listInfo = {
+    listType: null as 'bullet' | 'ordered' | null,
+    nestingLevel: 0,
+    prefixLen: 0
+  };
+
+  const listRegex = /^(\t*)(?:(\*\s)|(\d+\.\s))/;
+  const listMatch = listRegex.exec(text);
+  if (listMatch) {
+    listInfo.nestingLevel = listMatch[1].length;
+    if (listMatch[2]) {
+      listInfo.listType = 'bullet';
+    } else if (listMatch[3]) {
+      listInfo.listType = 'ordered';
+    }
+    listInfo.prefixLen = listMatch[0].length;
+    text = (keepTabs ? listMatch[1] : '') + text.substring(listInfo.prefixLen);
+  }
+
+  // 3. Parse inline style tags
+  const styles: StyleRange[] = [];
+  const tagRegex = /\{\{([a-zA-Z]+):([^}]+)\}\}/g;
+  
+  let plainText = '';
+  let lastIndex = 0;
+  let activeStyles: Record<string, { value: any; startIndex: number }> = {};
+
+  while ((match = tagRegex.exec(text)) !== null) {
+    const matchIndex = match.index;
+    
+    plainText += text.substring(lastIndex, matchIndex);
+    
+    const styleName = match[1];
+    const rawVal = match[2];
+    
+    let value: any = rawVal;
+    if (rawVal === 'true') value = true;
+    else if (rawVal === 'false') value = false;
+    else if (rawVal === 'default') value = 'default';
+    else if (!isNaN(Number(rawVal))) value = Number(rawVal);
+
+    const currentOffset = plainText.length;
+    
+    if (activeStyles[styleName]) {
+      const active = activeStyles[styleName];
+      if (currentOffset > active.startIndex) {
+        styles.push({
+          styleName,
+          value: active.value,
+          startIndex: active.startIndex,
+          endIndex: currentOffset
+        });
+      }
+      delete activeStyles[styleName];
+    }
+    
+    if (value !== 'default' && value !== false) {
+      activeStyles[styleName] = {
+        value,
+        startIndex: currentOffset
+      };
+    }
+    
+    lastIndex = tagRegex.lastIndex;
+  }
+  
+  plainText += text.substring(lastIndex);
+  
+  const currentOffset = plainText.length;
+  for (const styleName in activeStyles) {
+    const active = activeStyles[styleName];
+    if (currentOffset > active.startIndex) {
+      styles.push({
+        styleName,
+        value: active.value,
+        startIndex: active.startIndex,
+        endIndex: currentOffset
+      });
+    }
+  }
+
+  return {
+    plainText,
+    styles,
+    listInfo,
+    paragraphStyles
+  };
+}
+
+export function stripStyleTags(text: string): string {
+  return text.replace(/\{\{[a-zA-Z]+:[^}]+\}\}/g, '');
+}
+
 export function processInsertionText(text: string, tabId: string | null, inlineObjects: any): any[] {
   let cleanText = text.replace(/\uFFFC\[table:\d+\]\n?/g, '[Table]\n');
 
@@ -483,26 +898,68 @@ export function translateOpsToDocOps(
       }
     } else if (op.type === 'insert') {
       const docIndex = translateLinearToDocIndex(op.linearStart, elementMap);
-      const parts = processInsertionText(op.text || '', tabId, inlineObjects);
+      let textToSplit = op.text || '';
+      if (textToSplit.endsWith('\n')) {
+        textToSplit = textToSplit.slice(0, -1);
+      }
+      const lines = textToSplit.split('\n');
+      
       let currentOffset = 0;
+      const cleanLines: string[] = [];
+
+      for (let j = 0; j < lines.length; j++) {
+        const line = lines[j];
+        if (line.startsWith('{{table:') && line.endsWith('}}')) {
+          try {
+            const jsonStr = line.substring(8, line.length - 2);
+            const metadata = JSON.parse(jsonStr);
+            docOps.push({
+              type: 'insert_table',
+              index: docIndex + currentOffset,
+              rows: metadata.rows,
+              cols: metadata.cols,
+              backgroundColors: metadata.backgroundColors,
+              cells: metadata.cells,
+            });
+            // Placeholder takes 1 character (newline)
+            currentOffset += 1;
+            cleanLines.push(''); // will become empty paragraph when joined with \n
+          } catch (e) {
+            console.error('Failed to parse table JSON in insertion:', e);
+            cleanLines.push(line);
+            const parsed = parseStyleTagsAndPrefixes(line, true);
+            currentOffset += parsed.plainText.length + 1;
+          }
+        } else {
+          cleanLines.push(line);
+          const parsed = parseStyleTagsAndPrefixes(line, true);
+          currentOffset += parsed.plainText.length + 1;
+        }
+      }
+
+      // Join the clean lines to insert as a single text block
+      const plainTextToInsert = cleanLines.map((line: string) => parseStyleTagsAndPrefixes(line, true).plainText).join('\n');
+      
+      const parts = processInsertionText(plainTextToInsert, tabId, inlineObjects);
+      let textOffset = 0;
 
       for (let j = 0; j < parts.length; j++) {
         const part = parts[j];
         if (part.type === 'text') {
           docOps.push({
             type: 'insert_text',
-            index: docIndex + currentOffset,
+            index: docIndex + textOffset,
             text: part.text,
           });
-          currentOffset += part.text.length;
+          textOffset += part.text.length;
         } else if (part.type === 'image') {
           docOps.push({
             type: 'insert_image',
-            index: docIndex + currentOffset,
+            index: docIndex + textOffset,
             objectId: part.objectId,
             src: part.src,
           });
-          currentOffset += 1;
+          textOffset += 1;
         }
       }
     }
@@ -616,3 +1073,21 @@ export function applyPatchToText(text: string, patch: string): [string, any, boo
   const result = dmp.patch_apply(patches, text);
   return [result[0], patches, result[1]];
 }
+
+export function applyOtToText(text: string, operations: OtOperation[]): string {
+  let result = '';
+  let cursor = 0;
+  for (const op of operations) {
+    if (op.type === 'retain') {
+      const count = op.count || 0;
+      result += text.substring(cursor, cursor + count);
+      cursor += count;
+    } else if (op.type === 'delete') {
+      cursor += op.count || 0;
+    } else if (op.type === 'insert') {
+      result += op.text || '';
+    }
+  }
+  return result;
+}
+

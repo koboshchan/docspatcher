@@ -1,6 +1,6 @@
 import { getOrRefreshToken, invalidateToken } from './token-manager.js';
 import { FileMetadata } from './types.js';
-import { resolveImageUrl } from './patch-engine.js';
+import { resolveImageUrl, parseStyleTagsAndPrefixes, namedStyleTypeFromHeadingLevel, hexToRgbColor, resolveDocTabContext } from './patch-engine.js';
 
 async function makeRestRequest(method: string, url: string, body?: any, retried = false): Promise<any> {
   const token = await getOrRefreshToken();
@@ -207,8 +207,12 @@ export async function applyDocOpsToDocument(
   tabContext: any,
   docOps: any[]
 ): Promise<number> {
-  // Sort descending (Right-to-Left)
-  docOps.sort((a, b) => {
+  const insertTableOps = docOps.filter(op => op.type === 'insert_table');
+  const otherOps = docOps.filter(op => op.type !== 'insert_table');
+
+  // Phase 1: Apply all non-table insertions/deletions (this grows the doc and creates placeholders)
+  const phase1Ops = [...otherOps];
+  phase1Ops.sort((a, b) => {
     const idxA = a.type === 'delete' ? a.startIndex : a.index;
     const idxB = b.type === 'delete' ? b.startIndex : b.index;
     if (idxB !== idxA) {
@@ -224,8 +228,8 @@ export async function applyDocOpsToDocument(
   const tempFileIds: string[] = [];
 
   try {
-    for (let i = 0; i < docOps.length; i++) {
-      const op = docOps[i];
+    for (let i = 0; i < phase1Ops.length; i++) {
+      const op = phase1Ops[i];
       if (op.type === 'delete') {
         const range: any = { startIndex: op.startIndex, endIndex: op.endIndex };
         if (tabContext.tabId) range.tabId = tabContext.tabId;
@@ -243,7 +247,6 @@ export async function applyDocOpsToDocument(
         }
 
         if (url) {
-          // If it is googleusercontent, upload to temp public Drive file
           if (/googleusercontent\.com/i.test(url)) {
             try {
               const fileId = await uploadTemporaryImage(url);
@@ -273,7 +276,256 @@ export async function applyDocOpsToDocument(
       await docsApiBatchUpdate(documentId, requests);
     }
 
-    return requests.length;
+    let totalRequests = requests.length;
+
+    // Phase 2: Insert empty table structures & delete placeholders
+    if (insertTableOps.length > 0) {
+      const phase2StructureRequests: any[] = [];
+      const sortedInsertTableOps = [...insertTableOps].sort((a, b) => b.index - a.index);
+      
+      for (const op of sortedInsertTableOps) {
+        const range: any = { startIndex: op.index, endIndex: op.index + 1 };
+        if (tabContext.tabId) range.tabId = tabContext.tabId;
+        phase2StructureRequests.push({ deleteContentRange: { range } });
+
+        const location: any = { index: op.index };
+        if (tabContext.tabId) location.tabId = tabContext.tabId;
+        phase2StructureRequests.push({
+          insertTable: {
+            rows: op.rows,
+            columns: op.cols,
+            location
+          }
+        });
+      }
+
+      if (phase2StructureRequests.length > 0) {
+        await docsApiBatchUpdate(documentId, phase2StructureRequests);
+        totalRequests += phase2StructureRequests.length;
+      }
+
+      // Phase 3: Insert empty table cells' plain text
+      const updatedDoc = await docsApiGetDocument(documentId, true);
+      const updatedTabContext = resolveDocTabContext(updatedDoc, tabContext.tabId);
+
+      const updatedContent = updatedTabContext.content || [];
+      const updatedTables = updatedContent.filter((block: any) => block.table);
+
+      // Sort insertTableOps ascending to calculate cumulative length shift correctly
+      const ascendingInsertTableOps = [...insertTableOps].sort((a, b) => a.index - b.index);
+      const phase3Requests: any[] = [];
+      let cumulativeTableLengthShift = 0;
+
+      for (const op of ascendingInsertTableOps) {
+        const expectedStartIndex = op.index + cumulativeTableLengthShift;
+        const matchTable = updatedTables.find((tb: any) => Math.abs(Number(tb.startIndex) - expectedStartIndex) <= 5);
+        if (!matchTable) {
+          console.warn(`Could not find empty table near expected index ${expectedStartIndex}`);
+          continue;
+        }
+
+        const actualStartIndex = Number(matchTable.startIndex);
+        const tableLen = Number(matchTable.endIndex) - actualStartIndex;
+        cumulativeTableLengthShift += (tableLen - 1);
+
+        const rows = matchTable.table.tableRows || [];
+        for (let r = 0; r < rows.length; r++) {
+          const row = rows[r];
+          const cells = row.tableCells || [];
+          for (let c = 0; c < cells.length; c++) {
+            const cell = cells[c];
+            const cellText = op.cells?.[r]?.[c] || '';
+            const cellStartIndex = Number(cell.startIndex);
+
+            if (cellText) {
+              const parsed = parseStyleTagsAndPrefixes(cellText, true);
+              let plainText = parsed.plainText;
+              if (plainText.endsWith('\n')) {
+                plainText = plainText.slice(0, -1);
+              }
+
+              if (plainText.length > 0) {
+                const location: any = { index: cellStartIndex + 1 };
+                if (tabContext.tabId) location.tabId = tabContext.tabId;
+                phase3Requests.push({
+                  insertText: {
+                    location,
+                    text: plainText
+                  }
+                });
+              }
+            }
+          }
+        }
+      }
+
+      if (phase3Requests.length > 0) {
+        // Sort descending by index
+        phase3Requests.sort((a, b) => b.insertText.location.index - a.insertText.location.index);
+        await docsApiBatchUpdate(documentId, phase3Requests);
+        totalRequests += phase3Requests.length;
+      }
+
+      // Phase 4: Apply styling and formatting (background color, paragraph style, text style)
+      const styledDoc = await docsApiGetDocument(documentId, true);
+      const styledTabContext = resolveDocTabContext(styledDoc, tabContext.tabId);
+
+      const styledContent = styledTabContext.content || [];
+      const styledTables = styledContent.filter((block: any) => block.table);
+
+      const phase4Requests: any[] = [];
+      let cumulativeTableLengthShift4 = 0;
+
+      for (const op of ascendingInsertTableOps) {
+        const expectedStartIndex = op.index + cumulativeTableLengthShift4;
+        const matchTable = styledTables.find((tb: any) => Math.abs(Number(tb.startIndex) - expectedStartIndex) <= 5);
+        if (!matchTable) {
+          console.warn(`Could not find table for styling near expected index ${expectedStartIndex}`);
+          continue;
+        }
+
+        const actualStartIndex = Number(matchTable.startIndex);
+        const tableLen = Number(matchTable.endIndex) - actualStartIndex;
+        cumulativeTableLengthShift4 += (tableLen - 1);
+
+        const rows = matchTable.table.tableRows || [];
+        for (let r = 0; r < rows.length; r++) {
+          const row = rows[r];
+          const cells = row.tableCells || [];
+          for (let c = 0; c < cells.length; c++) {
+            const cell = cells[c];
+            const cellText = op.cells?.[r]?.[c] || '';
+            const cellBg = op.backgroundColors?.[r]?.[c] || 'default';
+            const cellStartIndex = Number(cell.startIndex);
+
+            // 1. Background color
+            if (cellBg !== 'default') {
+              const rgb = hexToRgbColor(cellBg);
+              if (rgb) {
+                const tableStartLocation: any = { index: actualStartIndex };
+                if (tabContext.tabId) tableStartLocation.tabId = tabContext.tabId;
+                phase4Requests.push({
+                  updateTableCellStyle: {
+                    tableCellStyle: {
+                      backgroundColor: {
+                        color: {
+                          rgbColor: rgb
+                        }
+                      }
+                    },
+                    fields: 'backgroundColor',
+                    tableRange: {
+                      tableCellLocation: {
+                        tableStartLocation,
+                        rowIndex: r,
+                        columnIndex: c
+                      },
+                      rowSpan: 1,
+                      columnSpan: 1
+                    }
+                  }
+                });
+              }
+            }
+
+            // 2. Styling
+            if (cellText) {
+              const parsed = parseStyleTagsAndPrefixes(cellText, true);
+
+              // Paragraph styles
+              const pStyle: any = {};
+              let pFields = '';
+              if (parsed.paragraphStyles.align) {
+                pStyle.alignment = parsed.paragraphStyles.align;
+                pFields += 'alignment,';
+              }
+              if (parsed.paragraphStyles.heading !== undefined) {
+                pStyle.namedStyleType = namedStyleTypeFromHeadingLevel(parsed.paragraphStyles.heading);
+                pFields += 'namedStyleType,';
+              }
+
+              if (pFields) {
+                const range: any = { startIndex: cellStartIndex + 1, endIndex: cellStartIndex + 2 };
+                if (tabContext.tabId) range.tabId = tabContext.tabId;
+                phase4Requests.push({
+                  updateParagraphStyle: {
+                    paragraphStyle: pStyle,
+                    fields: pFields.slice(0, -1),
+                    range
+                  }
+                });
+              }
+
+              // Text styles
+              for (const styleRange of parsed.styles) {
+                const start = cellStartIndex + 1 + styleRange.startIndex;
+                const end = cellStartIndex + 1 + styleRange.endIndex;
+                if (end > start) {
+                  const range: any = { startIndex: start, endIndex: end };
+                  if (tabContext.tabId) range.tabId = tabContext.tabId;
+
+                  const textStyle: any = {};
+                  let textFields = '';
+
+                  if (styleRange.styleName === 'bold') {
+                    textStyle.bold = styleRange.value;
+                    textFields = 'bold';
+                  } else if (styleRange.styleName === 'italic') {
+                    textStyle.italic = styleRange.value;
+                    textFields = 'italic';
+                  } else if (styleRange.styleName === 'underline') {
+                    textStyle.underline = styleRange.value;
+                    textFields = 'underline';
+                  } else if (styleRange.styleName === 'strikethrough') {
+                    textStyle.strikethrough = styleRange.value;
+                    textFields = 'strikethrough';
+                  } else if (styleRange.styleName === 'fontSize') {
+                    if (styleRange.value === 'default') {
+                      textStyle.fontSize = { magnitude: 11, unit: 'PT' };
+                    } else {
+                      textStyle.fontSize = { magnitude: styleRange.value, unit: 'PT' };
+                    }
+                    textFields = 'fontSize';
+                  } else if (styleRange.styleName === 'color') {
+                    if (styleRange.value === 'default') {
+                      textStyle.foregroundColor = {};
+                    } else {
+                      const rgb = hexToRgbColor(styleRange.value);
+                      if (rgb) {
+                        textStyle.foregroundColor = {
+                          color: {
+                            rgbColor: rgb
+                          }
+                        };
+                      }
+                    }
+                    textFields = 'foregroundColor';
+                  }
+
+                  if (textFields) {
+                    phase4Requests.push({
+                      updateTextStyle: {
+                        textStyle,
+                        fields: textFields,
+                        range
+                      }
+                    });
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      if (phase4Requests.length > 0) {
+        console.log("Phase 4 Requests:", JSON.stringify(phase4Requests, null, 2));
+        await docsApiBatchUpdate(documentId, phase4Requests);
+        totalRequests += phase4Requests.length;
+      }
+    }
+
+    return totalRequests;
   } finally {
     for (const fileId of tempFileIds) {
       try {
@@ -284,3 +536,250 @@ export async function applyDocOpsToDocument(
     }
   }
 }
+
+export async function syncDocumentStyles(
+  documentId: string,
+  tabId: string | null,
+  newLinearText: string
+): Promise<number> {
+  // Resolve tab context and paragraphs
+  let tabIdOrNull = tabId;
+  if (tabIdOrNull === '') tabIdOrNull = null;
+  
+  const freshDoc = await docsApiGetDocument(documentId, true);
+  
+  let content: any[] = [];
+  let targetTabId: string | null = null;
+
+  if (!tabIdOrNull) {
+    content = (freshDoc && freshDoc.body && freshDoc.body.content) || [];
+    targetTabId = null;
+  } else {
+    const match = findTabById((freshDoc && freshDoc.tabs) || [], tabIdOrNull);
+    if (match) {
+      const tab = match.tab;
+      const docTab = (tab && tab.documentTab) || {};
+      content = (docTab && docTab.body && docTab.body.content) || [];
+      targetTabId = tabIdOrNull;
+    } else {
+      content = (freshDoc && freshDoc.body && freshDoc.body.content) || [];
+      targetTabId = null;
+    }
+  }
+
+  const rawDocBlocks = content.filter((b: any) => b.paragraph || b.table);
+  const lines = newLinearText.split('\n');
+  if (lines.length > 0 && lines[lines.length - 1] === '') {
+    lines.pop(); // remove trailing newline split
+  }
+
+  const docBlocks: any[] = [];
+  let blockIdx = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (blockIdx >= rawDocBlocks.length) break;
+
+    const block = rawDocBlocks[blockIdx];
+    if (line.startsWith('{{table:')) {
+      // Expect table block. Skip any placeholder/padding empty paragraphs
+      while (blockIdx < rawDocBlocks.length && !rawDocBlocks[blockIdx].table) {
+        blockIdx++;
+      }
+      if (blockIdx < rawDocBlocks.length) {
+        docBlocks.push(rawDocBlocks[blockIdx]);
+        blockIdx++;
+      }
+    } else {
+      docBlocks.push(block);
+      blockIdx++;
+    }
+  }
+
+  console.log(`[syncDocumentStyles] tabId=${tabId}, resolved targetTabId=${targetTabId}`);
+  console.log(`[syncDocumentStyles] lines.length=${lines.length}, docBlocks.length=${docBlocks.length}`);
+
+  const stylingRequests: any[] = [];
+  const bulletRequests: any[] = [];
+
+  let currentListStart = -1;
+  let currentListEnd = -1;
+  let currentListType: 'bullet' | 'ordered' | null = null;
+
+  for (let i = 0; i < Math.min(lines.length, docBlocks.length); i++) {
+    const line = lines[i];
+    const block = docBlocks[i];
+    if (!block.paragraph) {
+      continue;
+    }
+    const paragraph = block.paragraph;
+    const docStart = Number(block.startIndex);
+    const docEnd = Number(block.endIndex);
+
+    // Parse styling for this line
+    const parsed = parseStyleTagsAndPrefixes(line);
+
+    // 1. Paragraph style updates (alignment & heading)
+    const pStyle: any = {};
+    let fields = '';
+
+    if (parsed.paragraphStyles.align) {
+      pStyle.alignment = parsed.paragraphStyles.align;
+      fields += 'alignment,';
+    }
+    if (parsed.paragraphStyles.heading !== undefined) {
+      pStyle.namedStyleType = namedStyleTypeFromHeadingLevel(parsed.paragraphStyles.heading);
+      fields += 'namedStyleType,';
+    }
+
+    if (fields) {
+      const range: any = { startIndex: docStart, endIndex: docEnd };
+      if (targetTabId) range.tabId = targetTabId;
+      stylingRequests.push({
+        updateParagraphStyle: {
+          paragraphStyle: pStyle,
+          fields: fields.slice(0, -1),
+          range
+        }
+      });
+    }
+
+    // 2. List bullet creation/deletion
+    if (paragraph.bullet && !parsed.listInfo.listType) {
+      const range: any = { startIndex: docStart, endIndex: docEnd };
+      if (targetTabId) range.tabId = targetTabId;
+      stylingRequests.push({
+        deleteParagraphBullets: {
+          range
+        }
+      });
+    }
+
+    const listType = parsed.listInfo.listType;
+    if (listType !== currentListType) {
+      if (currentListType && currentListStart !== -1) {
+        const preset = currentListType === 'bullet' ? 'BULLET_DISC_CIRCLE_SQUARE' : 'NUMBERED_DECIMAL_NESTED';
+        const range: any = { startIndex: currentListStart, endIndex: currentListEnd };
+        if (targetTabId) range.tabId = targetTabId;
+        bulletRequests.push({
+          createParagraphBullets: {
+            range,
+            bulletPreset: preset
+          }
+        });
+      }
+      if (listType) {
+        currentListStart = docStart;
+        currentListEnd = docEnd;
+        currentListType = listType;
+      } else {
+        currentListStart = -1;
+        currentListEnd = -1;
+        currentListType = null;
+      }
+    } else {
+      if (listType) {
+        currentListEnd = docEnd;
+      }
+    }
+
+    // 3. Inline style updates
+    for (const styleRange of parsed.styles) {
+      const start = docStart + styleRange.startIndex;
+      const end = docStart + styleRange.endIndex;
+
+      if (end > start) {
+        const range: any = { startIndex: start, endIndex: end };
+        if (targetTabId) range.tabId = targetTabId;
+
+        const textStyle: any = {};
+        let textFields = '';
+
+        if (styleRange.styleName === 'bold') {
+          textStyle.bold = styleRange.value;
+          textFields = 'bold';
+        } else if (styleRange.styleName === 'italic') {
+          textStyle.italic = styleRange.value;
+          textFields = 'italic';
+        } else if (styleRange.styleName === 'underline') {
+          textStyle.underline = styleRange.value;
+          textFields = 'underline';
+        } else if (styleRange.styleName === 'strikethrough') {
+          textStyle.strikethrough = styleRange.value;
+          textFields = 'strikethrough';
+        } else if (styleRange.styleName === 'fontSize') {
+          if (styleRange.value === 'default') {
+            textStyle.fontSize = { magnitude: 11, unit: 'PT' };
+          } else {
+            textStyle.fontSize = { magnitude: styleRange.value, unit: 'PT' };
+          }
+          textFields = 'fontSize';
+        } else if (styleRange.styleName === 'color') {
+          if (styleRange.value === 'default') {
+            textStyle.foregroundColor = {};
+          } else {
+            const rgb = hexToRgbColor(styleRange.value);
+            if (rgb) {
+              textStyle.foregroundColor = {
+                color: {
+                  rgbColor: rgb
+                }
+              };
+            }
+          }
+          textFields = 'foregroundColor';
+        }
+
+        if (textFields) {
+          stylingRequests.push({
+            updateTextStyle: {
+              textStyle,
+              fields: textFields,
+              range
+            }
+          });
+        }
+      }
+    }
+  }
+
+  if (currentListType && currentListStart !== -1) {
+    const preset = currentListType === 'bullet' ? 'BULLET_DISC_CIRCLE_SQUARE' : 'NUMBERED_DECIMAL_NESTED';
+    const range: any = { startIndex: currentListStart, endIndex: currentListEnd };
+    if (targetTabId) range.tabId = targetTabId;
+    bulletRequests.push({
+      createParagraphBullets: {
+        range,
+        bulletPreset: preset
+      }
+    });
+  }
+
+  if (stylingRequests.length > 0) {
+    console.log(`[syncDocumentStyles] Sending batchUpdate with ${stylingRequests.length} styling requests`);
+    await docsApiBatchUpdate(documentId, stylingRequests);
+  }
+
+  if (bulletRequests.length > 0) {
+    // Sort bullet requests descending by start index (Right-to-Left) to ensure index stability
+    bulletRequests.sort((a, b) => b.createParagraphBullets.range.startIndex - a.createParagraphBullets.range.startIndex);
+    console.log(`[syncDocumentStyles] Sending batchUpdate with ${bulletRequests.length} bullet requests`);
+    await docsApiBatchUpdate(documentId, bulletRequests);
+  }
+
+  return stylingRequests.length + bulletRequests.length;
+}
+
+function findTabById(tabs: any[], tabId: string): any {
+  for (let i = 0; i < tabs.length; i++) {
+    const tab = tabs[i];
+    if (!tab) continue;
+    const props = tab.tabProperties || {};
+    const id = String(props.tabId || tab.tabId || '');
+    if (id === tabId) return { tab };
+    const children = tab.childTabs || [];
+    const nested = findTabById(children, tabId);
+    if (nested) return nested;
+  }
+  return null;
+}
+

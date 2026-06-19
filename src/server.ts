@@ -16,7 +16,8 @@ import {
   applyPatchToText,
   getLinearOperations,
   translateOpsToDocOps,
-  getLinearOpsFromOt
+  getLinearOpsFromOt,
+  applyOtToText
 } from './patch-engine.js';
 
 const PORT = Number(process.env.PORT || 3000);
@@ -352,6 +353,9 @@ mcpServer.tool(
     const docOps = translateOpsToDocOps(linearOps, elementMap, tabContext.tabId, tabContext.inlineObjects);
     const appliedOperationsCount = await googleApi.applyDocOpsToDocument(id, tabContext, docOps);
 
+    // Sync styles
+    await googleApi.syncDocumentStyles(id, tabContext.tabId, text2);
+
     const result = {
       algorithm,
       format: normalizedFormat,
@@ -372,7 +376,7 @@ mcpServer.tool(
   'Apply safe, non-destructive text changes to a document tab using direct index tracking components.',
   {
     id: z.string().min(1),
-    tabId: z.string().min(1),
+    tabId: z.string().min(1).optional(),
     operations: z.array(
       z.object({
         type: z.enum(['retain', 'insert', 'delete']),
@@ -385,11 +389,16 @@ mcpServer.tool(
     const doc = await googleApi.docsApiGetDocument(id, true);
     const tabContext = resolveDocTabContext(doc, tabId);
     const linearData = getLinearTextAndMap(doc, tabContext);
+    const originalText = linearData.text;
     const elementMap = linearData.elementMap;
 
+    const text2 = applyOtToText(originalText, operations);
     const linearOps = getLinearOpsFromOt(operations);
     const docOps = translateOpsToDocOps(linearOps, elementMap, tabContext.tabId, tabContext.inlineObjects);
     const appliedOperationsCount = await googleApi.applyDocOpsToDocument(id, tabContext, docOps);
+
+    // Sync styles
+    await googleApi.syncDocumentStyles(id, tabContext.tabId, text2);
 
     const result = {
       success: true,

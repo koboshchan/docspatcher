@@ -44,3 +44,19 @@ export interface Config {
   token?: string;
   tokenExpiresAt?: number;
 }
+
+export interface TextStyleState {
+  bold?: boolean;
+  italic?: boolean;
+  underline?: boolean;
+  strikethrough?: boolean;
+  color?: string; // Hex (e.g., "#FF0000") or "default"
+  fontSize?: number | 'default';
+}
+
+export interface ParagraphStyleState {
+  align?: 'START' | 'CENTER' | 'RIGHT' | 'JUSTIFIED';
+  heading?: number; // 0 for normal, 1-4 for HEADING_1 to HEADING_4
+  listType?: 'bullet' | 'ordered' | null;
+  nestingLevel?: number;
+}
